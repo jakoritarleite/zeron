@@ -35,9 +35,18 @@
 //!   204); the END of the turn is the terminal execution/status frame for
 //!   THAT session — exactly what the desktop's working-predicate keys on.
 //!   Busy is re-asserted at the top of every agent-loop iteration, so idle
-//!   after busy is authoritative, not a lull.
+//!   after busy is authoritative, not a lull. A busy with NO turn in flight
+//!   is a WAKE execution: the server re-invoked the session on its own (a
+//!   background subagent finished and its completion notice woke the
+//!   parent) — it arms a turn so the wake's idle still settles with a Done.
 //! - reasoning streams as reasoning parts on both wires →
 //!   [`AgentEvent::ReasoningDelta`], the thinking feed.
+//! - the agent's `question` tool reaches the engine's input bridge on both
+//!   wires: 1.x emits `question.asked` (reply `POST /question/{id}/reply`),
+//!   while 2.x (2.0.24+) creates a session FORM titled "Questions"
+//!   (`form.created`, reply `POST /api/session/{id}/form/{formID}/reply`
+//!   with `{answer:{q0:..}}`; verified live against 2.0.24), folded into
+//!   the same question flow.
 //!
 //! Failure surfacing (the #169 class): a dying provider is VISIBLE here —
 //! `session.status{type:"retry", attempt, message}` streams per attempt.
@@ -2273,6 +2282,7 @@ async fn run_session(session: Session) {
                             turn: &mut turn,
                             pending_usage: &mut pending_usage,
                             context_windows: &context_windows,
+                            stall,
                         }).await;
                         match outcome {
                             BusOutcome::Continue => maybe_preempt!(),
@@ -2768,6 +2778,9 @@ struct BusCtx<'a> {
     turn: &'a mut TurnState,
     pending_usage: &'a mut Option<AgentEvent>,
     context_windows: &'a HashMap<String, u64>,
+    /// The run's startup stall bound, for re-arming a SELF-CONTINUED wake
+    /// turn (one the server starts with no prompt from us).
+    stall: Option<Duration>,
 }
 
 /// Wrap an event as subagent-attributed traffic.
@@ -2802,6 +2815,23 @@ async fn settle_children(
     }
 }
 
+/// A child session's execution terminal, as its chip's `Done` status. The 2.x
+/// normalize path maps execution terminals onto these kinds; 1.x emits them
+/// directly.
+fn child_terminal(kind: &str, props: &Value) -> Option<DoneStatus> {
+    match kind {
+        "session.idle" => Some(DoneStatus::Completed),
+        "session.interrupted" => Some(DoneStatus::Interrupted),
+        "session.error" => Some(DoneStatus::Errored),
+        "session.status"
+            if props.pointer("/status/type").and_then(Value::as_str) == Some("idle") =>
+        {
+            Some(DoneStatus::Completed)
+        }
+        _ => None,
+    }
+}
+
 /// Route one `/global/event` payload. The envelope is
 /// `{directory, payload: {type, properties}}`; `sync` mirror frames drop.
 async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
@@ -2819,6 +2849,7 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
         turn,
         pending_usage,
         context_windows,
+        stall,
     } = ctx;
     // Envelope styles: /global/event wraps ({payload: {...}}); a bare
     // /event feed (tests) delivers the payload directly.
@@ -2873,11 +2904,51 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
         turn.note_activity();
     }
 
+    // A child session's own execution terminal settles its chip. It is the
+    // ONLY settle a backgrounded spawn ever gets: its `task` part completed
+    // at spawn time, so its content kept the child live instead.
+    if !is_ours
+        && let Some(child_id) = event_session
+        && let Some(status) = child_terminal(kind, props)
+        && let Some(child) = children.get_mut(child_id)
+        && !child.done
+    {
+        child.done = true;
+        let parent = child.parent_tool_use_id.clone();
+        return forward(
+            event_tx,
+            vec![tag(
+                &parent,
+                AgentEvent::Done {
+                    status,
+                    result: None,
+                    error: None,
+                    session_id: None,
+                },
+            )],
+        )
+        .await;
+    }
+
     match kind {
         "session.status" if is_ours => {
             let status = props.get("status").unwrap_or(&Value::Null);
             match status.get("type").and_then(Value::as_str) {
-                Some("busy") => turn.idle_ready = true,
+                Some("busy") => {
+                    // A busy on OUR session with no turn in flight is a
+                    // WAKE execution: the server re-invoked the session on
+                    // its own (a background subagent finished and its
+                    // completion notice woke the parent). Re-arm the turn so
+                    // its terminal idle still settles with
+                    // AssistantMessageCompleted + Done — the engine resumed
+                    // the parked transcript on this turn's output and, for
+                    // this deterministic-turn-end driver, keeps no quiesce
+                    // watchdog to rescue a swallowed Done.
+                    if !turn.active {
+                        *turn = TurnState::begin(stall);
+                    }
+                    turn.idle_ready = true;
+                }
                 Some("retry") => {
                     turn.idle_ready = true;
                     let attempt = status.get("attempt").and_then(Value::as_u64).unwrap_or(0);
@@ -3043,8 +3114,13 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                 );
                 mark_content(turn, &events);
                 let mut settle: Vec<AgentEvent> = Vec::new();
-                // A completed `task` part settles its child chip.
-                if let Some((child_session, failed)) = task_completion(part) {
+                // A completed `task` part settles its child chip — unless it
+                // only BACKGROUNDED the child (opencode answers the spawn
+                // immediately), in which case the child stays live until its
+                // own execution terminal settles the chip.
+                if let Some((child_session, failed)) = task_completion(part)
+                    && !task_backgrounded(part)
+                {
                     let by_meta = children
                         .get_mut(&child_session)
                         .map(|c| (child_session.clone(), c));
@@ -3201,37 +3277,40 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
             BusOutcome::Continue
         }
         "question.asked" => {
-            if !event_session.is_some_and(|session| {
-                session == session_id
-                    || children.get(session).is_some_and(|child| !child.done)
-                    || unbound_children.contains_key(session)
-            }) {
+            // A global bus includes unrelated sessions. Never answer their
+            // requests, or a malformed request without an explicit owner.
+            let Some(session) = event_session.filter(|session| {
+                *session == session_id
+                    || children.get(*session).is_some_and(|child| !child.done)
+                    || unbound_children.contains_key(*session)
+            }) else {
                 return BusOutcome::Continue;
-            }
+            };
+            let session = session.to_owned();
             let Some(id) = props.get("id").and_then(Value::as_str) else {
                 return BusOutcome::Continue;
             };
-            let questions = map_questions(props);
-            if questions.is_empty() {
+            // Panel ids are minted per question, like Claude and Codex; the
+            // paired key is what a 2.x form reply addresses.
+            let pairs = map_questions(props);
+            if pairs.is_empty() {
                 return BusOutcome::Continue;
             }
-            if !send(
-                event_tx,
-                AgentEvent::InputRequested {
-                    request_id: id.to_owned(),
-                    questions: questions.clone(),
-                },
-            )
-            .await
-            {
-                return BusOutcome::ConsumerGone;
-            }
-            let rx = (request_input)(questions.clone());
+            // 2.x (2.0.24+) ships the `question` tool as a session form; its
+            // answers ride the session's form route, keyed by field.
+            let is_form = props.get("form").and_then(Value::as_bool).unwrap_or(false);
+            // The engine's input bridge is the SOLE emitter of
+            // `InputRequested`/`InputResolved`: it mints the request id,
+            // parks the resolver for `respond_input`, and surfaces both
+            // events. Emitting our own copy here (keyed by opencode's id)
+            // folded a SECOND, unanswerable input part into the doc whose id
+            // no resolver knew — the QuestionPanel answered that twin and the
+            // run never resumed (the same fix Claude and Codex got).
+            let rx = (request_input)(pairs.iter().map(|(_, question)| question.clone()).collect());
             let base = server.base.clone();
             let auth = server.auth.clone();
             let dir_owned = dir.map(str::to_owned);
             let request_id = id.to_owned();
-            let tx = event_tx.clone();
             let protocol_cell = server.protocol.clone();
             tokio::spawn(async move {
                 let server = Server {
@@ -3244,10 +3323,19 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                     version: tokio::sync::OnceCell::new(),
                 };
                 let reply = match rx.await {
+                    Ok(answers) if is_form => {
+                        server
+                            .post_json(
+                                &format!("/api/session/{session}/form/{request_id}/reply"),
+                                dir_owned.as_deref(),
+                                &form_answer_body(&pairs, &answers),
+                            )
+                            .await
+                    }
                     Ok(answers) => {
-                        let ordered: Vec<Vec<String>> = questions
+                        let ordered: Vec<Vec<String>> = pairs
                             .iter()
-                            .map(|q| {
+                            .map(|(_, q)| {
                                 answers
                                     .iter()
                                     .find(|a| a.question_id == q.id)
@@ -3263,6 +3351,12 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                             )
                             .await
                     }
+                    // A dropped resolver means the run — and with it this
+                    // OpenCode child — is already going away. Pending forms
+                    // are instance state and die with it, so there is nothing
+                    // left to cancel; only the 1.x route gets an explicit
+                    // reject.
+                    Err(_) if is_form => Ok(Value::Null),
                     Err(_) => {
                         server
                             .post_json(
@@ -3279,11 +3373,6 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                         "question reply failed: {e}"
                     );
                 }
-                let _ = tx
-                    .send(Ok(AgentEvent::InputResolved {
-                        request_id: request_id.clone(),
-                    }))
-                    .await;
             });
             BusOutcome::Continue
         }
@@ -3351,6 +3440,32 @@ fn task_completion(part: &Value) -> Option<(String, bool)> {
         .unwrap_or_default();
     Some((child.to_owned(), status == "error"))
 }
+
+/// True when a completed `task` part only BACKGROUNDED its subagent. opencode
+/// answers `background: true` immediately: the tool part completes with
+/// `metadata.status == "running"` ("The subagent is working in the background
+/// (sessionID: …)") while the child session keeps working. That is not the
+/// child's end — its own execution terminal is.
+fn task_backgrounded(part: &Value) -> bool {
+    let state = part.get("state").unwrap_or(&Value::Null);
+    if state
+        .get("metadata")
+        .and_then(|m| m.get("status"))
+        .and_then(Value::as_str)
+        == Some("running")
+    {
+        return true;
+    }
+    // Frames from wires/versions that omit the metadata: the background
+    // answer's first line is a stable, tool-owned string.
+    state
+        .get("output")
+        .and_then(Value::as_str)
+        .is_some_and(|output| output.starts_with(BACKGROUND_SPAWN_OUTPUT))
+}
+
+/// First line of opencode's immediate answer to a `background: true` spawn.
+const BACKGROUND_SPAWN_OUTPUT: &str = "The subagent is working in the background";
 
 /// Bind a fresh child session to a spawn chip: description match against the
 /// child title (`"{description} (@{agent} subagent)"`), else FIFO.
@@ -3690,8 +3805,11 @@ fn part_delta_events(
     }]
 }
 
-/// `question.asked` → the input panel's questions (ids are positional).
-fn map_questions(props: &Value) -> Vec<UserInputQuestion> {
+/// `question.asked` → the input panel's questions, each paired with the key a
+/// form reply must address (the form field key; positional `q0`.. when the
+/// payload carries none). Panel ids are minted per question, like Claude and
+/// Codex — wire values never become panel identity.
+fn map_questions(props: &Value) -> Vec<(String, UserInputQuestion)> {
     props
         .get("questions")
         .and_then(Value::as_array)
@@ -3700,32 +3818,65 @@ fn map_questions(props: &Value) -> Vec<UserInputQuestion> {
                 .enumerate()
                 .filter_map(|(ix, q)| {
                     let question = q.get("question").and_then(Value::as_str)?;
-                    Some(UserInputQuestion {
-                        id: format!("q{ix}"),
-                        header: q
-                            .get("header")
-                            .and_then(Value::as_str)
-                            .unwrap_or("Question")
-                            .to_owned(),
-                        question: question.to_owned(),
-                        options: q
-                            .get("options")
-                            .and_then(Value::as_array)
-                            .map(|opts| {
-                                opts.iter()
-                                    .filter_map(|o| o.get("label").and_then(Value::as_str))
-                                    .map(str::to_owned)
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                        prefill: None,
-                        multiline: false,
-                        multi_select: q.get("multiple").and_then(Value::as_bool).unwrap_or(false),
-                    })
+                    let key = q
+                        .get("key")
+                        .and_then(Value::as_str)
+                        .filter(|key| !key.is_empty())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("q{ix}"));
+                    Some((
+                        key,
+                        UserInputQuestion {
+                            id: new_message_id(),
+                            header: q
+                                .get("header")
+                                .and_then(Value::as_str)
+                                .unwrap_or("Question")
+                                .to_owned(),
+                            question: question.to_owned(),
+                            options: q
+                                .get("options")
+                                .and_then(Value::as_array)
+                                .map(|opts| {
+                                    opts.iter()
+                                        .filter_map(|o| o.get("label").and_then(Value::as_str))
+                                        .map(str::to_owned)
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                            prefill: None,
+                            multiline: false,
+                            multi_select: q
+                                .get("multiple")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                        },
+                    ))
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// 2.x question forms take answers keyed by field (`q0`..): one label for a
+/// single-select `string` field (empty when unanswered), the label array for
+/// a `multiselect` field.
+fn form_answer_body(pairs: &[(String, UserInputQuestion)], answers: &[UserInputAnswer]) -> Value {
+    let mut answer = serde_json::Map::new();
+    for (key, q) in pairs {
+        let labels = answers
+            .iter()
+            .find(|a| a.question_id == q.id)
+            .map(|a| a.labels.clone())
+            .unwrap_or_default();
+        let value = if q.multi_select {
+            json!(labels)
+        } else {
+            json!(labels.into_iter().next().unwrap_or_default())
+        };
+        answer.insert(key.clone(), value);
+    }
+    json!({ "answer": answer })
 }
 
 /// Cap for tool outputs entering the event stream (journal keeps the rest).
@@ -3872,6 +4023,11 @@ fn normalize_v2_frame_with_session_models(
 ) -> Vec<Value> {
     let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
     let data = event.get("data").cloned().unwrap_or(Value::Null);
+    // Form frames keep their owner inside `data.form` (the question tool's
+    // 2.0.24+ transport); everything else must name a session.
+    if kind == "form.created" {
+        return v2_question_form_payload(data.get("form").unwrap_or(&data));
+    }
     if data
         .get("sessionID")
         .and_then(Value::as_str)
@@ -4040,12 +4196,14 @@ fn normalize_v2_frame_with_session_models(
                         .join("\n")
                 })
                 .unwrap_or_default();
-            vec![v2_tool_part(
-                &data,
-                id,
-                &name,
-                &json!({ "status": "completed", "output": output }),
-            )]
+            let mut state = json!({ "status": "completed", "output": output });
+            // The tool's own metadata carries lifecycle nuance the 1.x part
+            // shape has no home for: a `background: true` subagent answers
+            // `{status: "running"}` from an already-completed task part.
+            if let Some(metadata) = data.get("metadata").filter(|m| m.is_object()) {
+                state["metadata"] = metadata.clone();
+            }
+            vec![v2_tool_part(&data, id, &name, &state)]
         }
         "session.tool.failed" | "session.tool.error" => {
             let id = data.get("id").and_then(Value::as_str).unwrap_or_default();
@@ -4057,12 +4215,11 @@ fn normalize_v2_frame_with_session_models(
                 .map(str::to_owned)
                 .or_else(|| error.as_str().map(str::to_owned))
                 .unwrap_or_default();
-            vec![v2_tool_part(
-                &data,
-                id,
-                &name,
-                &json!({ "status": "error", "error": message }),
-            )]
+            let mut state = json!({ "status": "error", "error": message });
+            if let Some(metadata) = data.get("metadata").filter(|m| m.is_object()) {
+                state["metadata"] = metadata.clone();
+            }
+            vec![v2_tool_part(&data, id, &name, &state)]
         }
         "session.step.ended" => {
             let tokens = data.get("tokens").cloned().unwrap_or(Value::Null);
@@ -4128,6 +4285,85 @@ fn normalize_v2_frame_with_session_models(
         }
         _ => Vec::new(),
     }
+}
+
+/// 2.x (2.0.24+) implements the agent's `question` tool as a session FORM:
+/// `form.created` carries `form.metadata.kind == "question"` and one field
+/// per question (`q0`..: `title` = header, `description` = question text,
+/// `options`, `multiselect` for multi-select; observed live against 2.0.24).
+/// Fold it into the 1.x `question.asked` payload — the shared question flow —
+/// carrying each field's key so the reply, which rides the session's form
+/// route, can address it (panel ids are minted downstream). Forms from other
+/// features (metadata kind absent) are not the question panel's to answer.
+fn v2_question_form_payload(form: &Value) -> Vec<Value> {
+    if form.pointer("/metadata/kind").and_then(Value::as_str) != Some("question") {
+        return Vec::new();
+    }
+    let (Some(id), Some(session_id)) = (
+        form.get("id").and_then(Value::as_str),
+        form.get("sessionID").and_then(Value::as_str),
+    ) else {
+        return Vec::new();
+    };
+    let questions: Vec<Value> = form
+        .get("fields")
+        .and_then(Value::as_array)
+        .map(|fields| {
+            fields
+                .iter()
+                .filter_map(|field| {
+                    let question = field
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .filter(|q| !q.trim().is_empty())
+                        .or_else(|| field.get("title").and_then(Value::as_str))
+                        .filter(|q| !q.trim().is_empty())?;
+                    Some(json!({
+                        "key": field
+                            .get("key")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                        "header": field
+                            .get("title")
+                            .and_then(Value::as_str)
+                            .filter(|h| !h.is_empty())
+                            .unwrap_or("Question"),
+                        "question": question,
+                        "multiple": field.get("type").and_then(Value::as_str)
+                            == Some("multiselect"),
+                        // The answer is the option's VALUE (the question tool
+                        // sets value == label, so display stays right).
+                        "options": field
+                            .get("options")
+                            .and_then(Value::as_array)
+                            .map(|opts| {
+                                opts.iter()
+                                    .filter_map(|o| {
+                                        o.get("value")
+                                            .and_then(Value::as_str)
+                                            .or_else(|| o.get("label").and_then(Value::as_str))
+                                            .map(|label| json!({ "label": label }))
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default(),
+                    }))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if questions.is_empty() {
+        return Vec::new();
+    }
+    vec![json!({
+        "type": "question.asked",
+        "properties": {
+            "id": id,
+            "sessionID": session_id,
+            "form": true,
+            "questions": questions,
+        }
+    })]
 }
 
 /// The 2.x error shape (`{type, message}`) folded into the 1.x
