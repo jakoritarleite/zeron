@@ -2681,6 +2681,160 @@ struct FoldState {
     user_expansion_height: f32,
 }
 
+/// The render-local state a user bubble needs: its expand/collapse fold and the
+/// measured natural height of its text. A surface that renders user messages
+/// itself (outside zeron's `Transcript`) keeps one of these so a virtualized row
+/// that scrolls away and back keeps its expansion.
+///
+/// The caller supplies the text element — mentions, selection and attachments
+/// stay its policy — and gets the cell its paint must record the laid-out
+/// height into. This is the additive half of the transcript-row extraction:
+/// `Transcript` still renders its own user rows, and a later change can move it
+/// onto this view.
+#[derive(Clone, Default)]
+pub struct UserRowView {
+    folds: Rc<RefCell<HashMap<SharedString, FoldState>>>,
+    heights: Rc<RefCell<HashMap<SharedString, Rc<Cell<f32>>>>>,
+}
+
+impl UserRowView {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Render `text`'s body clipped to [`USER_COLLAPSED_LINES`], with the
+    /// Show more/less expander. `text_element` builds the text itself and must
+    /// write its laid-out height into the given cell on paint; `on_toggle` runs
+    /// after the fold flips so the owner can notify.
+    pub fn render(
+        &self,
+        row_id: &SharedString,
+        text: &SharedString,
+        theme: &Theme,
+        window: &Window,
+        reduced: bool,
+        text_element: impl FnOnce(Rc<Cell<f32>>) -> AnyElement,
+        on_toggle: Rc<dyn Fn(&mut Window, &mut gpui::App)>,
+    ) -> AnyElement {
+        let fold = self.folds.borrow().get(row_id).copied().unwrap_or_default();
+        let expanded = fold.open.unwrap_or(false);
+        let line_height =
+            f32::from(crate::typography::ui_rems(USER_LINE_HEIGHT).to_pixels(window.rem_size()));
+        let collapsed_text_h = USER_COLLAPSED_LINES as f32 * line_height;
+        let collapsed_h = collapsed_text_h + line_height;
+        let measured_h = self
+            .heights
+            .borrow_mut()
+            .entry(row_id.clone())
+            .or_insert_with(|| Rc::new(Cell::new(0.0)))
+            .clone();
+        let measured = measured_h.get();
+        let collapsible = text.lines().count() > USER_COLLAPSED_LINES
+            || (measured > 0.0 && measured > collapsed_text_h + 0.5)
+            || (measured == 0.0 && user_message_needs_collapse(text));
+        let full_h = measured_h.get().max(collapsed_h);
+        if let Some(fold) = self.folds.borrow_mut().get_mut(row_id) {
+            fold.user_expansion_height = (full_h - collapsed_h).max(0.0);
+        }
+
+        let body = text_element(measured_h.clone());
+        let duration_ms = fold
+            .duration_ms
+            .max(user_resize_duration_ms(full_h - collapsed_h));
+        let animating = collapsible
+            && fold.epoch > 0
+            && fold
+                .toggled_at
+                .is_some_and(|at| at.elapsed() < Duration::from_millis(duration_ms + 200))
+            && !reduced;
+        let ellipsis = || div().h(px(line_height)).child("...");
+        let body: AnyElement = if animating {
+            let from = fold.from;
+            let to = if expanded { full_h } else { collapsed_h };
+            let resize = user_resize_spec(full_h - collapsed_h);
+            let ellipsis_h = if expanded { 0.0 } else { line_height };
+            div()
+                .child(div().overflow_hidden().child(body).with_animation(
+                    SharedString::from(format!("{row_id}-user-resize-{}", fold.epoch)),
+                    resize.animation(),
+                    move |el, t| el.h(px((motion::lerp(from, to, t) - ellipsis_h).max(0.0))),
+                ))
+                .when(!expanded, |el| el.child(ellipsis()))
+                .into_any_element()
+        } else if collapsible && !expanded {
+            div()
+                .child(div().h(px(collapsed_text_h)).overflow_hidden().child(body))
+                .child(ellipsis())
+                .into_any_element()
+        } else {
+            body.into_any_element()
+        };
+
+        let toggle: Rc<dyn Fn(&mut Window, &mut gpui::App)> = {
+            let folds = self.folds.clone();
+            let on_toggle = on_toggle.clone();
+            let row_id = row_id.clone();
+            Rc::new(move |window: &mut Window, cx: &mut gpui::App| {
+                {
+                    let mut folds = folds.borrow_mut();
+                    let fold = folds.entry(row_id.clone()).or_default();
+                    let open = fold.open.unwrap_or(false);
+                    let now = Instant::now();
+                    fold.open = Some(!open);
+                    fold.epoch = fold.epoch.wrapping_add(1);
+                    fold.from = if open { collapsed_h } else { full_h };
+                    fold.toggled_at = Some(now);
+                    fold.disclosure_at = Some(now);
+                    fold.duration_ms = user_resize_duration_ms(full_h - collapsed_h);
+                }
+                on_toggle(window, cx);
+            })
+        };
+        let expander = {
+            let glyph = if expanded {
+                crate::icons::ALT_ARROW_UP
+            } else {
+                crate::icons::ALT_ARROW_DOWN
+            };
+            let label = if expanded { "Show less" } else { "Show more" };
+            let toggle = toggle.clone();
+            div()
+                .id(SharedString::from(format!("{row_id}-expander")))
+                .group("user-message-toggle")
+                .role(gpui::Role::Button)
+                .aria_label(if expanded {
+                    "Collapse message"
+                } else {
+                    "Expand message"
+                })
+                .aria_expanded(expanded)
+                .flex()
+                .items_center()
+                .gap(px(5.0))
+                .text_size(crate::typography::ui_rems(14.0))
+                .line_height(crate::typography::ui_rems(USER_LINE_HEIGHT))
+                .text_color(theme.text_muted)
+                .cursor_pointer()
+                .hover(|s| s.text_color(theme.text))
+                .child(label)
+                .child(
+                    crate::icons::icon(glyph)
+                        .size(px(12.0))
+                        .text_color(theme.text_muted)
+                        .group_hover("user-message-toggle", |s| s.text_color(theme.text)),
+                )
+                .on_click(move |_, window, cx| toggle(window, cx))
+        };
+        div()
+            .relative()
+            .child(body)
+            .when(collapsible, |el| {
+                el.child(div().mt(px(USER_TOGGLE_GAP)).flex().child(expander))
+            })
+            .into_any_element()
+    }
+}
+
 /// Reveal epochs for one live ordinary tool group. `None` means the row was
 /// already present when this transcript attached (or has finished revealing),
 /// so replaying history and scrolling a virtualized row back into view stay
