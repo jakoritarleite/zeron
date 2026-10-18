@@ -9519,8 +9519,17 @@ enum ChipTrail {
 /// Opens a tool chip's file in the files panel through the transcript's
 /// workspace-link handler.
 #[derive(Clone)]
-struct ToolFileOpener {
+/// Routes a tool row's file badges through a link surface (zeron's workspace
+/// links). Build one from [`render::LinkUi::web`] for a shell without
+/// workspace-file roots.
+pub struct ToolFileOpener {
     link: render::LinkUi,
+}
+
+impl ToolFileOpener {
+    pub fn new(link: render::LinkUi) -> Self {
+        Self { link }
+    }
 }
 
 impl ToolFileOpener {
@@ -10036,7 +10045,11 @@ fn activity_ribbon(path: &mut PathBuilder, points: &[Point<Pixels>]) {
 }
 
 /// A plain activity row, or a card for a subagent without a linked document.
-fn tool_chip(
+/// One tool call's card row: the activity rail plus the chip (icon, label,
+/// detail and badges). Pure given a [`ToolItem`]; `file_opener` routes file
+/// badges, and `view`/`cx` drive its spinner. The caller owns the click that
+/// expands a detail and the body below the chip.
+pub fn tool_chip(
     tool: &ToolItem,
     rail: bool,
     has_predecessor: bool,
