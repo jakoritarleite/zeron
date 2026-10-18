@@ -2361,6 +2361,92 @@ fn worked_for_label(secs: i64) -> String {
     format!("Worked for {}", format_elapsed(secs))
 }
 
+/// Everything the tool-group header row needs, computed by its owner: the
+/// group's summary, its live shimmer, and the disclosure progress.
+pub struct ToolGroupHeader {
+    pub row_id: SharedString,
+    pub summary: SharedString,
+    /// The rolled title while the summary is mid-change
+    /// ([`crate::roll_text::rolling`]); falls back to the plain title.
+    pub rolled_summary: Option<AnyElement>,
+    pub shimmer_phase: Option<f32>,
+    /// Compact mode's "Worked for …" label and its fade (else `None`).
+    pub worked: Option<(SharedString, f32)>,
+    pub disclosure_progress: f32,
+}
+
+/// The quiet tool-group header: the disclosure chevron on the activity trunk
+/// and the (optionally shimmering / rolling) summary. `on_click` toggles the
+/// group's fold. This is the row a shell that renders tool groups itself shares
+/// with zeron's transcript.
+pub fn tool_group_header(
+    data: ToolGroupHeader,
+    theme: &Theme,
+    on_click: Rc<dyn Fn(&mut Window, &mut gpui::App)>,
+) -> AnyElement {
+    let ToolGroupHeader {
+        row_id,
+        summary,
+        rolled_summary,
+        shimmer_phase,
+        worked,
+        disclosure_progress,
+    } = data;
+    div()
+        .id(SharedString::from(format!("{row_id}-hdr")))
+        .relative()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.0))
+        .pr(px(4.0))
+        .h(px(TOOL_GROUP_HEADER_HEIGHT))
+        .cursor_pointer()
+        .text_size(px(TOOL_LABEL_SIZE))
+        .line_height(px(TOOL_LABEL_LINE_HEIGHT))
+        .text_color(theme.text_muted)
+        .hover(|s| s.text_color(theme.text))
+        .on_click(move |_, window, cx| {
+            cx.stop_propagation();
+            on_click(window, cx);
+        })
+        .child(
+            div()
+                .w(px(22.0))
+                .h(px(18.0))
+                .flex_none()
+                .relative()
+                .child(
+                    crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
+                        .absolute()
+                        .left(px(ACTIVITY_TRUNK_X - 7.0))
+                        .top(px(2.0))
+                        .size(px(14.0))
+                        .with_transformation(gpui::Transformation::rotate(gpui::radians(
+                            -std::f32::consts::FRAC_PI_2 * (1.0 - disclosure_progress),
+                        )))
+                        .text_color(theme.text_muted),
+                ),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .h(px(TOOL_LABEL_LINE_HEIGHT))
+                .flex()
+                .items_center()
+                .overflow_hidden()
+                .child(match worked {
+                    Some((label, fade_t)) => {
+                        compact_work_title(summary.clone(), label, fade_t, shimmer_phase, theme)
+                    }
+                    None => rolled_summary.unwrap_or_else(|| {
+                        tool_group_title(summary.clone(), shimmer_phase, theme)
+                    }),
+                }),
+        )
+        .into_any_element()
+}
+
 /// Compact-mode header: the live tool summary crossfades into "Worked for".
 /// `t` is 0 = summary, 1 = duration.
 fn compact_work_title(
@@ -8320,72 +8406,28 @@ impl Transcript {
             summary.clone(),
             reduce_motion,
         );
-        let toggle_id = row_id.clone();
-        // A quiet summary sits above the activity rail; its chevron occupies
-        // the same gutter as the rounded task-tree elbows below it.
-        let header = div()
-            .id(SharedString::from(format!("{row_id}-hdr")))
-            .relative()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(6.0))
-            .pr(px(4.0))
-            .h(px(TOOL_GROUP_HEADER_HEIGHT))
-            .cursor_pointer()
-            .text_size(px(TOOL_LABEL_SIZE))
-            .line_height(px(TOOL_LABEL_LINE_HEIGHT))
-            // Quiet even when children failed: agents routinely have failed
-            // probes mid-work, and a red HEADER read as "this whole step
-            // broke" (user report). Failures still show on the individual
-            // chips (destructive tint, zeron tool-chip.tsx) and in the
-            // summary's "· N failed" count.
-            .text_color(theme.text_muted)
-            .hover(|s| s.text_color(theme.text))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                cx.stop_propagation();
-                this.toggle_fold(toggle_id.clone(), viewport_height, effective_auto_open, cx);
-                cx.notify();
-            }))
-            .child(
-                div()
-                    // Keep the title adjacent to its disclosure affordance.
-                    .w(px(22.0))
-                    .h(px(18.0))
-                    .flex_none()
-                    .relative()
-                    .child(
-                        crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
-                            .absolute()
-                            .left(px(ACTIVITY_TRUNK_X - 7.0))
-                            .top(px(2.0))
-                            .size(px(14.0))
-                            .with_transformation(gpui::Transformation::rotate(gpui::radians(
-                                -std::f32::consts::FRAC_PI_2 * (1.0 - disclosure_progress),
-                            )))
-                            .text_color(theme.text_muted),
-                    ),
-            )
-            .child(
-                div()
-                    .min_w_0()
-                    .h(px(TOOL_LABEL_LINE_HEIGHT))
-                    .flex()
-                    .items_center()
-                    .overflow_hidden()
-                    .child(match worked_secs {
-                        Some(secs) => compact_work_title(
-                            summary.clone(),
-                            SharedString::from(worked_for_label(secs)),
-                            worked_fade_t,
-                            shimmer_phase,
-                            theme,
-                        ),
-                        None => rolled_summary.unwrap_or_else(|| {
-                            tool_group_title(summary.clone(), shimmer_phase, theme)
-                        }),
-                    }),
-            );
+        let header = tool_group_header(
+            ToolGroupHeader {
+                row_id: row_id.clone(),
+                summary: summary.clone(),
+                rolled_summary,
+                shimmer_phase,
+                worked: worked_secs
+                    .map(|secs| (SharedString::from(worked_for_label(secs)), worked_fade_t)),
+                disclosure_progress,
+            },
+            theme,
+            {
+                let entity = cx.weak_entity();
+                let toggle_id = row_id.clone();
+                Rc::new(move |_window, cx| {
+                    let _ = entity.update(cx, |this, cx| {
+                        this.toggle_fold(toggle_id.clone(), viewport_height, effective_auto_open, cx);
+                        cx.notify();
+                    });
+                })
+            },
+        );
 
         if compact_shell {
             let view = cx.entity_id();
