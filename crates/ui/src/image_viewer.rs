@@ -6,7 +6,7 @@ use gpui::{
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 #[derive(Clone, Default)]
-pub(crate) struct ImageView(Rc<RefCell<ViewState>>);
+pub struct ImageView(Rc<RefCell<ViewState>>);
 
 #[derive(Default)]
 struct ViewState {
@@ -180,7 +180,7 @@ impl ViewState {
     }
 }
 
-pub(crate) type ImageClick = Rc<dyn Fn(&mut Window, &mut App)>;
+pub type ImageClick = Rc<dyn Fn(&mut Window, &mut App)>;
 
 impl ImageView {
     pub fn begin_click(&self) {

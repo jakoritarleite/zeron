@@ -2183,7 +2183,7 @@ const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 12] = [
 // (well over 2x the intra-list gap). Disclosure content gets a small 4px
 // handoff from its header without leaving dead space while collapsed.
 const SIDEBAR_SECTION_GAP: f32 = 12.0;
-pub(super) const SIDEBAR_DISCLOSURE_HEADER_HEIGHT: f32 = 28.0;
+pub const SIDEBAR_DISCLOSURE_HEADER_HEIGHT: f32 = 28.0;
 pub(super) const SIDEBAR_DISCLOSURE_BODY_INSET: f32 = 4.0;
 const SIDEBAR_DISCLOSURE_SECTION_HEIGHT: f32 =
     SIDEBAR_SECTION_GAP + SIDEBAR_DISCLOSURE_HEADER_HEIGHT;
@@ -2241,7 +2241,7 @@ pub(super) fn sidebar_separator(theme: &Theme) -> gpui::Div {
 /// groups and custom sections): a muted label, `count` as a muted badge
 /// beside it while the section is collapsed, then any action and the
 /// disclosure chevron.
-pub(super) fn sidebar_disclosure_header(
+pub fn sidebar_disclosure_header(
     theme: &Theme,
     icon: Option<AnyElement>,
     label: SharedString,
@@ -2274,13 +2274,13 @@ pub(super) fn sidebar_disclosure_header(
 }
 
 /// Section header glyphs (chevron, `+`, `…`) share the label's muted tone.
-pub(super) fn sidebar_header_glyph(theme: &Theme) -> gpui::Hsla {
+pub fn sidebar_header_glyph(theme: &Theme) -> gpui::Hsla {
     theme.text_muted.opacity(0.5)
 }
 
 /// A collapsed section's session count, cut like the sidebar's pull-request
 /// badge (16pt tall, 4pt radius, monospace digits) in a muted tone.
-fn sidebar_count_badge(theme: &Theme, count: usize) -> gpui::Div {
+pub fn sidebar_count_badge(theme: &Theme, count: usize) -> gpui::Div {
     div()
         .flex_none()
         .h(px(16.0))

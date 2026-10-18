@@ -5386,9 +5386,9 @@ pub enum ComposerEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MentionToken {
-    pub(crate) range: Range<usize>,
-    pub(crate) query: String,
+pub struct MentionToken {
+    pub range: Range<usize>,
+    pub query: String,
 }
 
 /// Refine a locally identified token using Markdown source ranges. This is
@@ -5508,7 +5508,7 @@ fn completion_markdown_end(
 
 /// The `@` must begin a token. This intentionally excludes `name@example.com`
 /// and ordinary words while allowing punctuation such as `(@src`.
-pub(crate) fn mention_token(text: &str, cursor: usize) -> Option<MentionToken> {
+pub fn mention_token(text: &str, cursor: usize) -> Option<MentionToken> {
     if cursor > text.len() || !text.is_char_boundary(cursor) {
         return None;
     }
@@ -10594,7 +10594,7 @@ impl Composer {
 /// The composer's send control: a size-7 filled circle with an up arrow,
 /// dimmed and inert while `blocked`. Other message composers reuse it so
 /// sending looks the same everywhere.
-pub(crate) fn send_circle(
+pub fn send_circle(
     id: &'static str,
     blocked: bool,
     theme: &Theme,

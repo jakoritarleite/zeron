@@ -43,14 +43,14 @@ fn lift(color: Hsla, amount: f32) -> Hsla {
 }
 
 /// One glass surface, applicable to an element or paintable in a canvas.
-pub(crate) struct Plate {
+pub struct Plate {
     background: Background,
     rim: Hsla,
     shadows: Vec<BoxShadow>,
 }
 
 impl Plate {
-    pub(crate) fn apply<E: Styled>(self, el: E) -> E {
+    pub fn apply<E: Styled>(self, el: E) -> E {
         el.bg(self.background)
             .border_1()
             .border_color(self.rim)
@@ -59,7 +59,7 @@ impl Plate {
 
     /// Paints the plate the way a styled element would: drops beneath the
     /// fill, the rim on it, and inset light above it.
-    pub(crate) fn paint(&self, window: &mut Window, bounds: Bounds<Pixels>, radius: f32) {
+    pub fn paint(&self, window: &mut Window, bounds: Bounds<Pixels>, radius: f32) {
         let corners = Corners::all(px(radius));
         let (inset, drop): (Vec<_>, Vec<_>) = self.shadows.iter().cloned().partition(|s| s.inset);
         window.paint_drop_shadows(bounds, corners, &drop);
@@ -79,7 +79,7 @@ impl Plate {
 /// translucent white off the surface; light ones sink a translucent tint
 /// into it (shaded under the top edge, lit inside the bottom edge), since a
 /// near-white plate on a near-white surface washes out.
-pub(crate) fn light_plate(theme: &Theme, t: f32) -> Plate {
+pub fn light_plate(theme: &Theme, t: f32) -> Plate {
     if theme.appearance.is_dark() {
         return Plate {
             background: vertical(white(0.08 * t), white(0.05 * t)),
@@ -104,7 +104,7 @@ pub(crate) fn light_plate(theme: &Theme, t: f32) -> Plate {
 
 /// Accent glass. `t` fades it in over the resting control; `glow` (0–1)
 /// spreads its coloured shadow.
-pub(crate) fn accent_plate(theme: &Theme, t: f32, glow: f32) -> Plate {
+pub fn accent_plate(theme: &Theme, t: f32, glow: f32) -> Plate {
     let dark = theme.appearance.is_dark();
     // The theme's fill token, as every other accent fill uses. Dark plates
     // keep their lighting faint so the token reads as itself, not a pastel.
@@ -135,7 +135,7 @@ pub(crate) fn accent_plate(theme: &Theme, t: f32, glow: f32) -> Plate {
 /// The opaque handle: the light-appearance neutral plate in every
 /// appearance, so it stays solid over translucent dark glass, with the
 /// appearance's own drop beneath it.
-pub(crate) fn thumb_plate(theme: &Theme) -> Plate {
+pub fn thumb_plate(theme: &Theme) -> Plate {
     let dark = theme.appearance.is_dark();
     let mut shadows = vec![
         shadow(white(0.8), 1.0, 0.0, 0.0, true),
@@ -152,10 +152,10 @@ pub(crate) fn thumb_plate(theme: &Theme) -> Plate {
     }
 }
 
-pub(crate) fn light<E: Styled>(el: E, theme: &Theme, t: f32) -> E {
+pub fn light<E: Styled>(el: E, theme: &Theme, t: f32) -> E {
     light_plate(theme, t).apply(el)
 }
 
-pub(crate) fn thumb<E: Styled>(el: E, theme: &Theme) -> E {
+pub fn thumb<E: Styled>(el: E, theme: &Theme) -> E {
     thumb_plate(theme).apply(el)
 }

@@ -4438,7 +4438,7 @@ fn code_text_viewport(
 /// Read-only unified row for PR diffs; reuse the Changes pane's gutters,
 /// source text, font settings, markers and semantic colors. The caller owns
 /// virtualization and the shared horizontal viewport.
-pub(crate) fn readonly_diff_line(
+pub fn readonly_diff_line(
     line: &DiffLine,
     spans: &[zeron_syntax::HighlightSpan],
     theme: &Theme,
@@ -4450,7 +4450,7 @@ pub(crate) fn readonly_diff_line(
 /// Read-only unified row whose code plane scrolls with `scroll` while the
 /// gutters stay put. Every row shares one extent, so a whole multi-file
 /// stream moves as one horizontal plane.
-pub(crate) fn readonly_scrolled_diff_line(
+pub fn readonly_scrolled_diff_line(
     line: &DiffLine,
     spans: &[zeron_syntax::HighlightSpan],
     theme: &Theme,
@@ -4898,7 +4898,7 @@ fn draft_cite_path(draft: &CommentDraft) -> &str {
 /// pane itself virtualizes these rows individually; this stacked form serves
 /// the transcript and the fold tween's clipped stand-in.)
 /// Full-document old/new highlighting for tool and checkout diffs.
-pub(crate) fn render_file_body_with_syntax(
+pub fn render_file_body_with_syntax(
     file: &FileDiff,
     highlights: Option<Arc<DiffHighlights>>,
     theme: &Theme,

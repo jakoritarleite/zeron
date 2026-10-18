@@ -149,7 +149,7 @@ fn latest_queued_message(items: &[QueuedMessage]) -> Option<&QueuedMessage> {
 
 /// Translate a pointer inside the whole panel into a row slot. The top pad
 /// belongs to slot zero; the bottom pad clamps to the final row.
-fn queue_drop_index(panel_y: f32, count: usize) -> usize {
+pub fn queue_drop_index(panel_y: f32, count: usize) -> usize {
     drop_index(panel_y - PANEL_PAD_TOP, ROW_SLOT, count)
 }
 
@@ -192,7 +192,7 @@ pub struct QueueDragState {
 
 /// Top of the lifted copy of a dragged row: under the pointer where it was
 /// grabbed, kept within the list.
-fn queue_lifted_top(pointer: f32, grab: f32, count: usize) -> f32 {
+pub fn queue_lifted_top(pointer: f32, grab: f32, count: usize) -> f32 {
     (pointer - grab).clamp(0.0, count.saturating_sub(1) as f32 * ROW_SLOT)
 }
 
@@ -244,7 +244,7 @@ fn queue_visible_text(text: &str, attachments: &[String]) -> String {
 /// The row's one-line label and the chips to paint over it. Commands, skills,
 /// files and attachments show the same chips as the transcript; editing and
 /// delivery still read the stored text, which keeps their canonical links.
-fn queue_row_text(
+pub fn queue_row_text(
     text: &str,
     attachments: &[String],
 ) -> (SharedString, Vec<crate::composer::SentMentionSpan>) {
@@ -284,7 +284,7 @@ fn queue_hidden_attachments_label(labels: &[String], shown: usize) -> Option<Str
 /// workspace paths and chats dropped on it reach the conversation's drop zone
 /// beneath (and land in this composer); otherwise it keeps clicks and hover
 /// from falling through to the transcript behind it.
-pub(crate) fn queue_panel_surface(theme: &Theme, dragging: bool) -> gpui::Div {
+pub fn queue_panel_surface(theme: &Theme, dragging: bool) -> gpui::Div {
     div()
         .when(!dragging, |el| el.occlude())
         .rounded_t(px(PANEL_RADIUS))
@@ -308,7 +308,7 @@ pub(crate) fn queue_panel_surface(theme: &Theme, dragging: bool) -> gpui::Div {
         .flex_col()
 }
 
-fn queue_rows(
+pub fn queue_rows(
     scroll: &gpui::ScrollHandle,
     max_height: gpui::Pixels,
     rows: impl IntoIterator<Item = AnyElement>,

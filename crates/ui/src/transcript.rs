@@ -425,7 +425,7 @@ const THOUGHT_WRAP_COLS: usize = 96;
 /// bullets, quote bars, verbatim code lines). Every line is one fixed-height
 /// row, so the detail height stays analytic (lines × [`OUTPUT_LINE_HEIGHT`])
 /// and the group's fold tween keeps working without measurement.
-fn thought_lines(tree: &BlockTree) -> Vec<Vec<InlineRun>> {
+pub fn thought_lines(tree: &BlockTree) -> Vec<Vec<InlineRun>> {
     let mut out: Vec<Vec<InlineRun>> = Vec::new();
     for top in &tree.blocks {
         if !out.is_empty() {
@@ -589,7 +589,7 @@ fn wrap_styled_runs(runs: &[InlineRun], indent: usize, out: &mut Vec<Vec<InlineR
 }
 
 /// One markdown block into thought detail lines, `indent` spaces deep.
-fn thought_block_lines(block: &Block, indent: usize, out: &mut Vec<Vec<InlineRun>>) {
+pub fn thought_block_lines(block: &Block, indent: usize, out: &mut Vec<Vec<InlineRun>>) {
     match block {
         Block::Paragraph { runs } => wrap_styled_runs(runs, indent, out),
         Block::Heading { runs, .. } => {
@@ -707,7 +707,7 @@ fn thought_block_lines(block: &Block, indent: usize, out: &mut Vec<Vec<InlineRun
 /// the group's fold tween needs it; see [`thought_lines`]). Capped like tool
 /// outputs, with the counted tail. `live` = the part is still streaming
 /// (chip defaults open).
-fn thought_item(part_id: &str, tree: &BlockTree, live: bool) -> ToolItem {
+pub fn thought_item(part_id: &str, tree: &BlockTree, live: bool) -> ToolItem {
     let mut lines = thought_lines(tree);
     let truncated_by = lines.len().saturating_sub(OUTPUT_DETAIL_MAX_LINES);
     if truncated_by > 0 {
@@ -757,7 +757,7 @@ fn thought_item(part_id: &str, tree: &BlockTree, live: bool) -> ToolItem {
 /// as a "Wrote" chip whose detail is the text's markdown flattened exactly
 /// like a thought's. `live` = the part is the streaming tail — unresolved,
 /// so the collapsed header keeps its working shimmer until the reply lands.
-fn note_item(part_id: &str, tree: &BlockTree, live: bool) -> ToolItem {
+pub fn note_item(part_id: &str, tree: &BlockTree, live: bool) -> ToolItem {
     let mut item = thought_item(part_id, tree, live);
     item.call = ToolCall::Unknown {
         name: "Note".into(),
@@ -868,7 +868,7 @@ pub fn tool_detail(
 const OUTPUT_LINE_MAX_CHARS: usize = 8 * 1024;
 
 /// One verbatim output line, cut to [`OUTPUT_LINE_MAX_CHARS`] with an ellipsis.
-fn output_line(line: &str) -> SharedString {
+pub fn output_line(line: &str) -> SharedString {
     match line.char_indices().nth(OUTPUT_LINE_MAX_CHARS) {
         Some((cut, _)) => SharedString::from(format!("{}…", &line[..cut])),
         None => SharedString::from(line.to_owned()),
@@ -882,7 +882,7 @@ pub const CALL_WRAP_COLS: usize = 80;
 
 /// Soft-wrap one raw line into [`CALL_WRAP_COLS`]-char chunks so a long
 /// single-line command stays fully readable instead of ellipsizing.
-fn wrap_cols(line: &str, cols: usize) -> Vec<SharedString> {
+pub fn wrap_cols(line: &str, cols: usize) -> Vec<SharedString> {
     if line.chars().count() <= cols {
         return vec![SharedString::from(line.to_owned())];
     }
@@ -2084,7 +2084,7 @@ pub fn tool_group_summary(tools: &[ToolItem]) -> String {
     summary
 }
 
-fn tool_group_title(text: SharedString, shimmer_phase: Option<f32>, theme: &Theme) -> AnyElement {
+pub fn tool_group_title(text: SharedString, shimmer_phase: Option<f32>, theme: &Theme) -> AnyElement {
     let Some(shimmer_phase) = shimmer_phase else {
         // Keep the ordinary inherited hover color when the group is settled
         // (and when reduced motion turns the active shimmer off).
@@ -8991,7 +8991,7 @@ impl gpui::Element for ChipOverlays {
 /// A sent message's non-image attachment: the file's icon and name on the
 /// same soft pill the transcript uses for file badges. Its bytes are never
 /// read back to the transcript, so there is no thumbnail to wait for.
-fn user_file_pill(name: &str, theme: &Theme) -> AnyElement {
+pub fn user_file_pill(name: &str, theme: &Theme) -> AnyElement {
     let name = crate::attachments::attachment_display_name(name);
     div()
         .h(px(28.0))
@@ -9039,7 +9039,7 @@ fn user_file_pill(name: &str, theme: &Theme) -> AnyElement {
 /// WRAPS instead of truncating: startup-crash errors carry the agent's exit
 /// status and stderr, and a one-line ellipsis was exactly what made
 /// zeronsh/comet#95 undiagnosable from the screenshot.
-fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
+pub fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
     div()
         .py(px(4.0))
         .w_full()
@@ -9053,7 +9053,7 @@ fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
 
 /// A quiet fork seam. The source gets its own constrained line so long
 /// titles cannot widen a narrow side-chat pane. No message metadata lane.
-fn fork_marker(source_title: SharedString, theme: &Theme) -> AnyElement {
+pub fn fork_marker(source_title: SharedString, theme: &Theme) -> AnyElement {
     let rule = || div().flex_1().min_w_0().h(px(1.0)).bg(theme.border_strong);
     div()
         .py(px(14.0))
@@ -9101,7 +9101,7 @@ fn fork_marker(source_title: SharedString, theme: &Theme) -> AnyElement {
 /// ChatRoundLine, the medium "Question" label, then the truncating value —
 /// the first question's header once resolved, "Awaiting your answer…" while
 /// pending. Neutral tones throughout; resolution never recolors the chip.
-fn input_chip(header: SharedString, resolved: bool, theme: &Theme) -> AnyElement {
+pub fn input_chip(header: SharedString, resolved: bool, theme: &Theme) -> AnyElement {
     let value: SharedString = if resolved {
         header
     } else {
@@ -9815,7 +9815,7 @@ pub(crate) fn subagent_tab_title(call: &ToolCall) -> SharedString {
 /// Clip one newly appended task row to its committed height. Fade and lift are
 /// applied to the row content itself, leaving the connector at full contrast
 /// while it draws; fading the whole row made the path animation imperceptible.
-fn reveal_tool_row(row: AnyElement, height: f32, progress: f32) -> AnyElement {
+pub fn reveal_tool_row(row: AnyElement, height: f32, progress: f32) -> AnyElement {
     if progress >= 1.0 {
         return row;
     }

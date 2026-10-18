@@ -1,6 +1,6 @@
 //! Discrete native feedback for user-driven control detents.
 
-pub(crate) fn selection_step() {
+pub fn selection_step() {
     #[cfg(all(target_os = "macos", not(test)))]
     {
         use objc2_app_kit::{
@@ -24,6 +24,6 @@ pub(crate) fn selection_step() {
 thread_local! { static STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
 #[cfg(test)]
-pub(crate) fn step_count() -> usize {
+pub fn step_count() -> usize {
     STEPS.with(|steps| steps.get())
 }

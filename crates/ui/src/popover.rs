@@ -13,7 +13,7 @@
 
 mod contained;
 mod hover_intent;
-pub(crate) use contained::{MenuAlign, contained_menu};
+pub use contained::{MenuAlign, contained_menu};
 pub use hover_intent::{HoverAction, HoverIntent};
 
 use gpui::{

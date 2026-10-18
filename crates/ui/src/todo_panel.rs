@@ -114,13 +114,13 @@ pub(crate) fn focus_window(items: &[TodoItem]) -> Range<usize> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FoldSide {
+pub enum FoldSide {
     Earlier,
     Later,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TodoRow {
+pub enum TodoRow {
     /// An item, by its index in the agent's list.
     Item(usize),
     /// A fold toggle standing in for `count` hidden items (`open`: they are
@@ -134,7 +134,7 @@ pub(crate) enum TodoRow {
 
 /// The rows of the expanded list, top to bottom. Items always keep the
 /// agent's order; folds sit at the edges of the list they stand for.
-pub(crate) fn rows(items: &[TodoItem], show_earlier: bool, show_later: bool) -> Vec<TodoRow> {
+pub fn rows(items: &[TodoItem], show_earlier: bool, show_later: bool) -> Vec<TodoRow> {
     let window = focus_window(items);
     let earlier = window.start;
     let later = items.len() - window.end;

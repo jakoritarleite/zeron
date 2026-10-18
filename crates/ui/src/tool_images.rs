@@ -36,7 +36,7 @@ const IMAGE_EXTENSIONS: [&str; 9] = [
     "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "tif", "tiff",
 ];
 
-pub(crate) fn is_image_path(path: &str) -> bool {
+pub fn is_image_path(path: &str) -> bool {
     let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
     name.rsplit_once('.').is_some_and(|(stem, ext)| {
         !stem.is_empty() && IMAGE_EXTENSIONS.iter().any(|e| ext.eq_ignore_ascii_case(e))
@@ -117,7 +117,7 @@ fn push_json_paths(out: &mut Vec<SharedString>, value: &serde_json::Value) {
 
 /// The image files a tool call touched, as reported (possibly relative to the
 /// chat's working directory). Computed once per row build, never per paint.
-pub(crate) fn image_paths(call: &ToolCall, output: Option<&str>) -> Arc<[SharedString]> {
+pub fn image_paths(call: &ToolCall, output: Option<&str>) -> Arc<[SharedString]> {
     let mut out = Vec::new();
     match call {
         ToolCall::ReadFile { path }
@@ -141,7 +141,7 @@ pub(crate) fn image_paths(call: &ToolCall, output: Option<&str>) -> Arc<[SharedS
 
 /// Absolute path on the owning host. Relative paths join the chat's cwd in
 /// that host's separator style (the UI may run on another OS).
-pub(crate) fn resolve_path(path: &str, cwd: Option<&str>) -> String {
+pub fn resolve_path(path: &str, cwd: Option<&str>) -> String {
     let bytes = path.as_bytes();
     let absolute = path.starts_with(['/', '\\'])
         || (bytes.len() >= 3

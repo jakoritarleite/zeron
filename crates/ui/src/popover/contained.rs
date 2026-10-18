@@ -9,14 +9,14 @@ use std::time::Instant;
 /// Which trigger edge the menu lines up with: `End` grows leftward from the
 /// trigger's right edge, `Start` rightward from its left edge.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum MenuAlign {
+pub enum MenuAlign {
     Start,
     End,
 }
 
 /// Mount from a relative trigger. The menu uses the available side of the
 /// trigger instead of sliding over it when it approaches the dialog edge.
-pub(crate) fn contained_menu(
+pub fn contained_menu(
     id: SharedString,
     content: gpui::Div,
     closing: Option<Instant>,

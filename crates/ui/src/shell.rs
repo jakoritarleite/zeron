@@ -91,6 +91,10 @@ mod sidebar_pins;
 mod sidebar_sections;
 mod search_warm;
 pub(crate) mod spaces;
+pub use spaces::{
+    SIDEBAR_DISCLOSURE_HEADER_HEIGHT, sidebar_count_badge, sidebar_disclosure_header,
+    sidebar_header_glyph,
+};
 mod thread_search;
 use side_chats::SideChatTab;
 mod tabs;
@@ -1030,7 +1034,7 @@ const SIDEBAR_FOOTER_AVATAR_SIZE: f32 = 16.0;
 
 /// Keep the fade short so only the last few glyphs recede. Tracking clipped
 /// content lets the shared paint-time overflow gate leave fitting labels intact.
-pub(crate) fn sidebar_faded_label(
+pub fn sidebar_faded_label(
     id: SharedString,
     fill: bool,
     label: impl IntoElement,
@@ -1061,7 +1065,7 @@ const SIDEBAR_FOOTER_ACTION_GAP: f32 = 4.0;
 /// A chat row's inline title editor, swapped in for its faded title while
 /// the chat is renamed in place: the title's 13/17 type in an accent-ringed
 /// field.
-pub(crate) fn chat_title_editor(
+pub fn chat_title_editor(
     id: SharedString,
     input: Entity<ComposerInput>,
     theme: &Theme,
@@ -13092,7 +13096,7 @@ fn grid_backdrop(theme: &Theme) -> AnyElement {
 
 /// A size-6 icon button for the titlebar strip (zeron window-controls.tsx:
 /// `grid size-6 place-items-center rounded-md text-muted-foreground`).
-fn window_control_button(
+pub fn window_control_button(
     id: &'static str,
     icon_path: &'static str,
     label: &'static str,
@@ -13105,7 +13109,7 @@ fn window_control_button(
 
 /// [`window_control_button`] around a caller-drawn glyph (the morphing
 /// sidebar glyph).
-fn window_control_button_with(
+pub fn window_control_button_with(
     id: &'static str,
     glyph: impl IntoElement,
     label: &'static str,
@@ -13261,7 +13265,7 @@ fn linux_caption_button(
 /// A titlebar history button (zeron window-controls.tsx): enabled it is a
 /// normal window-control button; disabled it dims to 35% opacity and ignores
 /// the pointer (`disabled:pointer-events-none disabled:opacity-35`).
-fn nav_history_button(
+pub fn nav_history_button(
     id: &'static str,
     icon_path: &'static str,
     label: &'static str,

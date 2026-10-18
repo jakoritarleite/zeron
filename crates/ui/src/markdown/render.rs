@@ -157,6 +157,19 @@ pub struct LinkUi {
 }
 
 impl LinkUi {
+    /// A link surface with no workspace-file roots: external links route
+    /// through `handler`, and no file links are offered.
+    pub fn web(
+        handler: impl Fn(&LinkActivation, &mut Window, &mut gpui::App) -> LinkOutcome + 'static,
+    ) -> Self {
+        Self {
+            source_session: None,
+            source_local: false,
+            file_roots: None,
+            handler: Rc::new(handler),
+        }
+    }
+
     /// The workspace file `target` resolves to under this surface's roots,
     /// when the link is one at all. Drives the trailing open glyph and the
     /// menu's file rows; the click path re-resolves with owners. Owned links
