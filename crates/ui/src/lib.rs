@@ -26,7 +26,7 @@ pub mod changes;
 mod comment_ui;
 pub mod comments;
 pub mod composer;
-mod composer_dock;
+pub mod composer_dock;
 mod composer_markdown;
 mod context_usage;
 mod dictation;

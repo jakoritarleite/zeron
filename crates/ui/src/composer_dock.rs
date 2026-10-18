@@ -49,13 +49,13 @@ impl Glide {
     }
 }
 
-pub(crate) fn stage(value: f32, start: f32, end: f32) -> f32 {
+pub fn stage(value: f32, start: f32, end: f32) -> f32 {
     let t = ((value - start) / (end - start)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct DockFrame {
+pub struct DockFrame {
     /// Canonical position: zero is the hero, one is the established thread.
     pub amount: f32,
     pub docked: bool,
@@ -94,7 +94,7 @@ impl DockFrame {
 /// the input changes mode, or attachments gain a row. Keep that discrete change
 /// out of the painted geometry without filtering the route animation itself.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct DockLayout {
+pub struct DockLayout {
     pub hero_height: f32,
     pub thread_height: f32,
     pub extra_height: f32,
@@ -111,7 +111,7 @@ impl DockLayout {
     }
 }
 
-pub(crate) struct DockReflow {
+pub struct DockReflow {
     previous: Option<(DockLayout, DockFrame)>,
     height_offset: Glide,
     compact_offset: Glide,
@@ -251,7 +251,7 @@ impl Visuals {
     }
 }
 
-pub(crate) struct DockState {
+pub struct DockState {
     pane: panel_handoff::PanelHandoff,
     conversation: Option<String>,
     phase: Glide,
@@ -503,11 +503,11 @@ fn duration(docked: bool) -> f32 {
     (if docked { 0.420 } else { 0.470 }) * crate::motion::speed_scale()
 }
 
-pub(crate) type SharedDock = Rc<RefCell<DockState>>;
+pub type SharedDock = Rc<RefCell<DockState>>;
 
 /// The child stays in this same layout slot on both routes. Only its prepaint
 /// origin changes; input hitboxes, selection and caret travel with its pixels.
-pub(crate) struct DockedComposer {
+pub struct DockedComposer {
     child: AnyElement,
     state: SharedDock,
     viewport_height: f32,
@@ -517,7 +517,7 @@ pub(crate) struct DockedComposer {
     shift_x: f32,
 }
 
-pub(crate) fn docked_composer(
+pub fn docked_composer(
     child: impl IntoElement,
     state: SharedDock,
     viewport_height: f32,
@@ -536,7 +536,10 @@ pub(crate) fn docked_composer(
 }
 
 impl DockedComposer {
-    pub fn reserve_terminal(mut self, geometry: crate::terminal::dock::SharedGeometry) -> Self {
+    pub(crate) fn reserve_terminal(
+        mut self,
+        geometry: crate::terminal::dock::SharedGeometry,
+    ) -> Self {
         self.terminal = Some(geometry);
         self
     }
