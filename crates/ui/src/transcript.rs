@@ -2702,10 +2702,79 @@ impl UserRowView {
         Self::default()
     }
 
+    /// The measured-height cell for `row_id`, created on first use.
+    pub fn measured(&self, row_id: &SharedString) -> Rc<Cell<f32>> {
+        self.heights
+            .borrow_mut()
+            .entry(row_id.clone())
+            .or_insert_with(|| Rc::new(Cell::new(0.0)))
+            .clone()
+    }
+
+    pub fn is_expanded(&self, row_id: &SharedString) -> bool {
+        self.folds
+            .borrow()
+            .get(row_id)
+            .is_some_and(|fold| fold.open == Some(true))
+    }
+
+    /// Pin a fold open or shut without a tween (restores and tests).
+    pub fn set_open(&self, row_id: &SharedString, open: bool) {
+        self.folds.borrow_mut().entry(row_id.clone()).or_default().open = Some(open);
+    }
+
+    /// Backdate a toggle so its tween reads as settled (tests).
+    pub fn set_toggled_at(&self, row_id: &SharedString, at: Option<Instant>) {
+        if let Some(fold) = self.folds.borrow_mut().get_mut(row_id) {
+            fold.toggled_at = at;
+        }
+    }
+
+    /// Flip `row_id`'s fold: exactly the state `Transcript::toggle_user_fold`
+    /// writes, so the owner keeps only its scroll anchoring.
+    pub fn toggle(&self, row_id: &SharedString, collapsed_h: f32, full_h: f32) {
+        let mut folds = self.folds.borrow_mut();
+        let entry = folds.entry(row_id.clone()).or_default();
+        let currently_open = entry.open.unwrap_or(false);
+        entry.from = if currently_open { full_h } else { collapsed_h };
+        entry.open = Some(!currently_open);
+        entry.epoch += 1;
+        entry.toggled_at = Some(Instant::now());
+        entry.duration_ms = user_resize_duration_ms(full_h - collapsed_h);
+        entry.user_expansion_height = (full_h - collapsed_h).max(0.0);
+    }
+
+    /// The reservation's expansion right now — zeron's tail-reservation tween,
+    /// which the owning surface adds to its own-turn hold.
+    pub fn expansion_now(&self, row_id: &SharedString, reduced: bool) -> f32 {
+        let fold = self.folds.borrow().get(row_id).copied().unwrap_or_default();
+        let target = if fold.open == Some(true) {
+            fold.user_expansion_height
+        } else {
+            0.0
+        };
+        match fold.toggled_at {
+            Some(at) if !reduced && fold.duration_ms > 0 => {
+                let raw = (at.elapsed().as_secs_f32() * 1000.0 / fold.duration_ms as f32)
+                    .clamp(0.0, 1.0);
+                let progress = user_resize_spec(fold.user_expansion_height).progress(raw);
+                motion::lerp(fold.user_expansion_height - target, target, progress)
+            }
+            _ => target,
+        }
+    }
+
+    pub fn clear(&self) {
+        self.folds.borrow_mut().clear();
+        self.heights.borrow_mut().clear();
+    }
+
     /// Render `text`'s body clipped to [`USER_COLLAPSED_LINES`], with the
     /// Show more/less expander. `text_element` builds the text itself and must
-    /// write its laid-out height into the given cell on paint; `on_toggle` runs
-    /// after the fold flips so the owner can notify.
+    /// write its laid-out height into the given cell on paint (it also receives
+    /// whether the body is collapsible and the collapsed height, so a caller can
+    /// attach its own long-press handlers); `on_toggle(collapsed_h, full_h, …)`
+    /// runs when the expander is clicked — the caller owns the fold flip.
     pub fn render(
         &self,
         row_id: &SharedString,
@@ -2713,21 +2782,17 @@ impl UserRowView {
         theme: &Theme,
         window: &Window,
         reduced: bool,
-        text_element: impl FnOnce(Rc<Cell<f32>>) -> AnyElement,
-        on_toggle: Rc<dyn Fn(&mut Window, &mut gpui::App)>,
+        text_element: impl FnOnce(Rc<Cell<f32>>, bool, f32) -> AnyElement,
+        on_toggle: Rc<dyn Fn(f32, f32, &mut Window, &mut gpui::App)>,
     ) -> AnyElement {
         let fold = self.folds.borrow().get(row_id).copied().unwrap_or_default();
         let expanded = fold.open.unwrap_or(false);
+
         let line_height =
             f32::from(crate::typography::ui_rems(USER_LINE_HEIGHT).to_pixels(window.rem_size()));
         let collapsed_text_h = USER_COLLAPSED_LINES as f32 * line_height;
         let collapsed_h = collapsed_text_h + line_height;
-        let measured_h = self
-            .heights
-            .borrow_mut()
-            .entry(row_id.clone())
-            .or_insert_with(|| Rc::new(Cell::new(0.0)))
-            .clone();
+        let measured_h = self.measured(row_id);
         let measured = measured_h.get();
         let collapsible = text.lines().count() > USER_COLLAPSED_LINES
             || (measured > 0.0 && measured > collapsed_text_h + 0.5)
@@ -2737,7 +2802,7 @@ impl UserRowView {
             fold.user_expansion_height = (full_h - collapsed_h).max(0.0);
         }
 
-        let body = text_element(measured_h.clone());
+        let body = text_element(measured_h.clone(), collapsible, collapsed_h);
         let duration_ms = fold
             .duration_ms
             .max(user_resize_duration_ms(full_h - collapsed_h));
@@ -2770,26 +2835,6 @@ impl UserRowView {
             body.into_any_element()
         };
 
-        let toggle: Rc<dyn Fn(&mut Window, &mut gpui::App)> = {
-            let folds = self.folds.clone();
-            let on_toggle = on_toggle.clone();
-            let row_id = row_id.clone();
-            Rc::new(move |window: &mut Window, cx: &mut gpui::App| {
-                {
-                    let mut folds = folds.borrow_mut();
-                    let fold = folds.entry(row_id.clone()).or_default();
-                    let open = fold.open.unwrap_or(false);
-                    let now = Instant::now();
-                    fold.open = Some(!open);
-                    fold.epoch = fold.epoch.wrapping_add(1);
-                    fold.from = if open { collapsed_h } else { full_h };
-                    fold.toggled_at = Some(now);
-                    fold.disclosure_at = Some(now);
-                    fold.duration_ms = user_resize_duration_ms(full_h - collapsed_h);
-                }
-                on_toggle(window, cx);
-            })
-        };
         let expander = {
             let glyph = if expanded {
                 crate::icons::ALT_ARROW_UP
@@ -2797,7 +2842,7 @@ impl UserRowView {
                 crate::icons::ALT_ARROW_DOWN
             };
             let label = if expanded { "Show less" } else { "Show more" };
-            let toggle = toggle.clone();
+            let on_toggle = on_toggle.clone();
             div()
                 .id(SharedString::from(format!("{row_id}-expander")))
                 .group("user-message-toggle")
@@ -2823,7 +2868,7 @@ impl UserRowView {
                         .text_color(theme.text_muted)
                         .group_hover("user-message-toggle", |s| s.text_color(theme.text)),
                 )
-                .on_click(move |_, window, cx| toggle(window, cx))
+                .on_click(move |_, window, cx| on_toggle(collapsed_h, full_h, window, cx))
         };
         div()
             .relative()
@@ -3368,15 +3413,11 @@ pub struct Transcript {
     /// group fold. Render-local like `folds` — never part of the row
     /// fingerprint.
     tool_details: HashMap<SharedString, FoldState>,
-    /// Expand/collapse state for user bubbles past [`USER_COLLAPSED_LINES`],
-    /// keyed by row id. Render-local like `folds` — never part of the row
-    /// fingerprint, so toggling one costs a repaint, not a rebuild.
-    user_folds: HashMap<SharedString, FoldState>,
-    /// Full laid-out text heights for long user bubbles. The text's paint
-    /// canvas writes these cells without notifying or mutating the transcript;
-    /// click handlers read them as exact endpoints for the RESIZE tween. This
-    /// preserves smooth layout motion without a paint → notify feedback loop.
-    user_heights: HashMap<SharedString, Rc<Cell<f32>>>,
+    /// The user bubbles' expand/collapse state and measured text heights
+    /// (zeron's [`UserRowView`]): the render-local state a surface that renders
+    /// user messages itself keeps. Never part of the row fingerprint, so
+    /// toggling one costs a repaint, not a rebuild.
+    user_rows: UserRowView,
     /// Pending long-press toggle. A single task is enough because only one
     /// pointer can own a hold gesture at a time; a token invalidates stale
     /// timers when the pointer is released or moves into a text selection.
@@ -3777,8 +3818,7 @@ impl Transcript {
             last_replay_baseline: None,
             historical_markdown: HashMap::new(),
             tool_details: HashMap::new(),
-            user_folds: HashMap::new(),
-            user_heights: HashMap::new(),
+            user_rows: UserRowView::new(),
             user_hold_task: None,
             user_hold_token: 0,
             user_collapse_scroll: None,
@@ -4435,22 +4475,9 @@ impl Transcript {
             // Revealing the prompt adds reading space; only reply growth
             // consumes the runway. Include the same expansion tween in the
             // reservation before layout, including its reverse on Show less.
-            let expansion = self.user_folds.get(&self.rows[ix].id).map_or(0.0, |fold| {
-                let target = if fold.open == Some(true) {
-                    fold.user_expansion_height
-                } else {
-                    0.0
-                };
-                match fold.toggled_at {
-                    Some(at) if !motion::reduced_motion(cx) && fold.duration_ms > 0 => {
-                        let raw = (at.elapsed().as_secs_f32() * 1000.0 / fold.duration_ms as f32)
-                            .clamp(0.0, 1.0);
-                        let progress = user_resize_spec(fold.user_expansion_height).progress(raw);
-                        motion::lerp(fold.user_expansion_height - target, target, progress)
-                    }
-                    _ => target,
-                }
-            });
+            let expansion = self
+                .user_rows
+                .expansion_now(&self.rows[ix].id, motion::reduced_motion(cx));
             self.list.set_tail_reservation(Some((
                 ix,
                 px(Self::own_send_inset(ix) - OWN_SEND_SCROLL_SLACK_PX - expansion),
@@ -4699,11 +4726,10 @@ impl Transcript {
         self.discard_pending_viewport();
         // An expanded prompt can be taller than the viewport. Its reservation
         // is retained, but jumping should reveal the reply below that prompt.
-        if self.own_turn_anchor_ix().is_some_and(|ix| {
-            self.user_folds
-                .get(&self.rows[ix].id)
-                .is_some_and(|fold| fold.open == Some(true))
-        }) {
+        if self
+            .own_turn_anchor_ix()
+            .is_some_and(|ix| self.user_rows.is_expanded(&self.rows[ix].id))
+        {
             self.release_own_turn_hold();
             self.engage_pin(cx);
             return;
@@ -4928,8 +4954,7 @@ impl Transcript {
             self.tool_group_reveals.clear();
             self.last_replay_baseline = None;
             self.historical_markdown.clear();
-            self.user_folds.clear();
-            self.user_heights.clear();
+            self.user_rows.clear();
             self.compact_fold_heights.clear();
             self.compact_fold_settle = None;
             self.user_hold_token = self.user_hold_token.wrapping_add(1);
@@ -5530,20 +5555,16 @@ impl Transcript {
         full_h: f32,
         reduced_motion: bool,
     ) {
+        let currently_open = self.user_rows.is_expanded(&row_id);
         let duration_ms = user_resize_duration_ms(full_h - collapsed_h);
         // A fold owns the viewport just like explicit navigation. Release
         // the sent-turn hold as well as the spring: otherwise growing beyond
         // the reserved space hands the still-held turn back to the bottom
         // pin and hides the beginning of the newly expanded prompt.
         self.begin_scroll_navigation();
-        let entry = self.user_folds.entry(row_id).or_default();
-        let currently_open = entry.open.unwrap_or(false);
-        entry.from = if currently_open { full_h } else { collapsed_h };
-        entry.open = Some(!currently_open);
-        entry.epoch += 1;
-        entry.toggled_at = Some(Instant::now());
-        entry.duration_ms = duration_ms;
-        entry.user_expansion_height = (full_h - collapsed_h).max(0.0);
+        // The fold state lives in the shared [`UserRowView`]; the scroll
+        // anchor below stays this surface's own.
+        self.user_rows.toggle(&row_id, collapsed_h, full_h);
 
         // Capture a screen-space anchor for the clicked row. We do not subtract
         // the removed height: that is only correct when the row's top is
@@ -6417,15 +6438,10 @@ impl Transcript {
     }
 
     /// The inside of a user bubble: the prompt text, clipped to
-    /// [`USER_COLLAPSED_LINES`] until expanded, plus the expander chevron for
-    /// prompts past the cap. Returns the bubble's children in order.
-    ///
-    /// The collapsed form clips a normally-laid-out text element at exactly
-    /// five line boxes. Do not use gpui's `line_clamp` here: on an auto-width
-    /// flex item it answers intrinsic-width probes with the truncated layout,
-    /// collapsing the bubble to min-content width (one character per line).
-    /// A plain height clip preserves the original bubble width calculation and
-    /// never feeds measured layout back into the virtualized list.
+    /// [`USER_COLLAPSED_LINES`] until expanded, plus the expander. The fold and
+    /// measured-height state live in the shared [`UserRowView`]; this method
+    /// supplies the chips-bearing text element and keeps the long-press gesture
+    /// (the scroll anchor stays in [`Self::toggle_user_fold`]).
     fn render_user_body(
         &mut self,
         row_id: &SharedString,
@@ -6437,199 +6453,91 @@ impl Transcript {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let chip_overlays = self.chip_overlays(row_id, &mentions, theme, cx);
-        let fold = self.user_folds.get(row_id).copied().unwrap_or_default();
-        let expanded = fold.open.unwrap_or(false);
-        let line_height =
-            f32::from(crate::typography::ui_rems(USER_LINE_HEIGHT).to_pixels(window.rem_size()));
-        let collapsed_text_h = USER_COLLAPSED_LINES as f32 * line_height;
-        // Include the continuation line in the resize endpoints so removing
-        // it on expansion does not make the bubble jump by a line.
-        let collapsed_h = collapsed_text_h + line_height;
-        let measured_h = self
-            .user_heights
-            .entry(row_id.clone())
-            .or_insert_with(|| Rc::new(Cell::new(0.0)))
-            .clone();
-        let measured = measured_h.get();
-        let collapsible = text.lines().count() > USER_COLLAPSED_LINES
-            || (measured > 0.0 && measured > collapsed_text_h + 0.5)
-            || (measured == 0.0 && user_message_needs_collapse(&text));
-        let full_h = measured_h.get().max(collapsed_h);
-        if let Some(fold) = self.user_folds.get_mut(row_id) {
-            // Wrapping can change with the window width while expanded.
-            fold.user_expansion_height = (full_h - collapsed_h).max(0.0);
-        }
-
-        let hold_key = row_id.clone();
-        let hold_height = measured_h.clone();
-        let hold_selection: Arc<str> = format!("{row_id}:u").into();
-        let body = div()
-            .id(SharedString::from(format!("{row_id}-body")))
-            // A long press toggles instead of double-click. A normal release
-            // remains available for text selection, and pointer movement
-            // cancels the pending toggle before a drag can select text.
-            .when(collapsible, |el| {
-                let down_key = hold_key.clone();
-                let down_height = hold_height.clone();
-                let down_selection = hold_selection.clone();
-                el.on_mouse_down(
-                    gpui::MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        this.arm_user_hold(
-                            down_key.clone(),
-                            row_ix,
-                            collapsed_h,
-                            down_height.clone(),
-                            down_selection.clone(),
-                            cx,
-                        );
-                    }),
-                )
-                .on_mouse_up(
-                    gpui::MouseButton::Left,
-                    cx.listener(move |this, _, _, _| {
-                        this.cancel_user_hold();
-                    }),
-                )
-                .on_mouse_up_out(
-                    gpui::MouseButton::Left,
-                    cx.listener(move |this, _, _, _| {
-                        this.cancel_user_hold();
-                    }),
-                )
-                .on_mouse_move(cx.listener(|this, _, _, _| {
-                    this.cancel_user_hold();
-                }))
+        let measured_h = self.user_rows.measured(row_id);
+        let reduced = motion::reduced_motion(cx);
+        let row_id_for_toggle = row_id.clone();
+        let entity = cx.weak_entity();
+        let on_toggle: Rc<dyn Fn(f32, f32, &mut Window, &mut gpui::App)> = Rc::new(
+            move |collapsed_h, full_h, _window, cx| {
+                let row_id = row_id_for_toggle.clone();
+                let _ = entity.update(cx, |this, cx| {
+                    this.toggle_user_fold(row_id, row_ix, collapsed_h, full_h, reduced);
+                    cx.notify();
+                });
+            },
+        );
+        let entity_id = cx.entity_id();
+        let open_image: Rc<dyn Fn(&SharedString, &mut Window, &mut gpui::App)> = {
+            let entity = cx.weak_entity();
+            Rc::new(move |path, window, cx| {
+                let _ = entity.update(cx, |this, cx| this.open_chip_image(path, window, cx));
             })
-            .child(user_bubble_text(
-                row_id,
-                text,
-                mentions,
-                theme,
-                measured_h.clone(),
-                cx.entity_id(),
-                chip_overlays,
-                Rc::new(cx.listener(|this, path: &SharedString, window, cx| {
-                    this.open_chip_image(path, window, cx);
-                })),
-            ));
-        // Height motion uses the same ease-out curve as sidebars, tool folds,
-        // and pane transitions, with duration scaled to travel distance. The
-        // full text remains laid out behind the clip; only the viewport over it
-        // changes, so glyph wrapping never shifts.
-        let duration_ms = fold
-            .duration_ms
-            .max(user_resize_duration_ms(full_h - collapsed_h));
-        let animating = collapsible
-            && fold.epoch > 0
-            && fold
-                .toggled_at
-                .is_some_and(|at| at.elapsed() < Duration::from_millis(duration_ms + 200))
-            && !motion::reduced_motion(cx);
-        let ellipsis = || div().h(px(line_height)).child("...");
-        let body: AnyElement = if animating {
-            let from = fold.from;
-            let to = if expanded { full_h } else { collapsed_h };
-            let resize = user_resize_spec(full_h - collapsed_h);
-            let ellipsis_h = if expanded { 0.0 } else { line_height };
-            div()
-                .child(div().overflow_hidden().child(body).with_animation(
-                    SharedString::from(format!("{row_id}-user-resize-{}", fold.epoch)),
-                    resize.animation(),
-                    move |el, t| el.h(px((motion::lerp(from, to, t) - ellipsis_h).max(0.0))),
-                ))
-                .when(!expanded, |el| el.child(ellipsis()))
-                .into_any_element()
-        } else if collapsible && !expanded {
-            div()
-                .child(div().h(px(collapsed_text_h)).overflow_hidden().child(body))
-                .child(ellipsis())
-                .into_any_element()
-        } else {
-            body.into_any_element()
         };
-        div()
-            .relative()
-            .child(body)
-            .when(collapsible, |el| {
-                el.child(self.render_user_expander(
-                    row_id,
-                    row_ix,
-                    expanded,
-                    collapsed_h,
-                    measured_h,
-                    theme,
-                    cx,
-                ))
-            })
-            .into_any_element()
+        let row_id_for_body = row_id.clone();
+        let text_for_body = text.clone();
+        let mentions_for_body = mentions.clone();
+        let theme_for_body = theme.clone();
+        let chip_overlays_for_body = chip_overlays;
+        let text_element = move |measured: Rc<Cell<f32>>, collapsible: bool, collapsed_h: f32| {
+            let row_id = row_id_for_body;
+            let body = user_bubble_text(
+                &row_id,
+                text_for_body,
+                mentions_for_body,
+                &theme_for_body,
+                measured.clone(),
+                entity_id,
+                chip_overlays_for_body,
+                open_image,
+            );
+            div()
+                .when(collapsible, |el| {
+                    let down_key = row_id.clone();
+                    let down_height = measured.clone();
+                    let down_selection: Arc<str> = format!("{row_id}:u").into();
+                    el.on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.arm_user_hold(
+                                down_key.clone(),
+                                row_ix,
+                                collapsed_h,
+                                down_height.clone(),
+                                down_selection.clone(),
+                                cx,
+                            );
+                        }),
+                    )
+                    .on_mouse_up(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, _, _, _| {
+                            this.cancel_user_hold();
+                        }),
+                    )
+                    .on_mouse_up_out(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, _, _, _| {
+                            this.cancel_user_hold();
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(|this, _, _, _| {
+                        this.cancel_user_hold();
+                    }))
+                })
+                .child(body)
+                .into_any_element()
+        };
+        self.user_rows.render(
+            row_id,
+            &text,
+            theme,
+            window,
+            reduced,
+            text_element,
+            on_toggle,
+        )
     }
 
-    /// A plain text link aligned with the message's left edge, following the
-    /// continuation ellipsis when collapsed. No pill, border, or button wash.
-    fn render_user_expander(
-        &mut self,
-        row_id: &SharedString,
-        row_ix: usize,
-        expanded: bool,
-        collapsed_h: f32,
-        measured_h: Rc<Cell<f32>>,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let toggle_key = row_id.clone();
-        let glyph = if expanded {
-            crate::icons::ALT_ARROW_UP
-        } else {
-            crate::icons::ALT_ARROW_DOWN
-        };
-        let label = if expanded { "Show less" } else { "Show more" };
-        let button = div()
-            .id(SharedString::from(format!("{row_id}-expander")))
-            .group("user-message-toggle")
-            .role(gpui::Role::Button)
-            .aria_label(if expanded {
-                "Collapse message"
-            } else {
-                "Expand message"
-            })
-            .aria_expanded(expanded)
-            .flex()
-            .items_center()
-            .gap(px(5.0))
-            .text_size(crate::typography::ui_rems(14.0))
-            .line_height(crate::typography::ui_rems(USER_LINE_HEIGHT))
-            .text_color(theme.text_muted)
-            .cursor_pointer()
-            .hover(|s| s.text_color(theme.text))
-            .child(label)
-            .child(
-                crate::icons::icon(glyph)
-                    .size(px(12.0))
-                    .text_color(theme.text_muted)
-                    .group_hover("user-message-toggle", |s| s.text_color(theme.text)),
-            )
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.toggle_user_fold(
-                    toggle_key.clone(),
-                    row_ix,
-                    collapsed_h,
-                    measured_h.get().max(collapsed_h),
-                    motion::reduced_motion(cx),
-                );
-                cx.notify();
-            }));
-        div()
-            .mt(px(USER_TOGGLE_GAP))
-            .flex()
-            .items_start()
-            .child(button)
-            .into_any_element()
-    }
-
-    /// Media wiring for settled Markdown: Mermaid fences become diagrams
-    /// once rendered and keep their source until then (or on failure).
-    /// Inline images keep their ordinary chat rendering.
     fn diagram_media(&mut self, cx: &Context<Self>) -> render::MediaUi {
         let cache = self.diagrams.clone();
         let owner = cx.weak_entity();
@@ -15053,7 +14961,7 @@ mod tests {
                 }
                 let before = transcript.read(cx).list.max_offset_for_scrollbar();
                 let toggle = |this: &mut Transcript, cx: &mut Context<Transcript>| {
-                    let full_h = this.user_heights["prompt"].get();
+                    let full_h = this.user_rows.measured(&"prompt".into()).get();
                     this.toggle_user_fold(
                         "prompt".into(),
                         0,
@@ -15061,8 +14969,8 @@ mod tests {
                         full_h,
                         true,
                     );
-                    this.user_folds.get_mut("prompt").unwrap().toggled_at =
-                        Some(Instant::now() - Duration::from_secs(5));
+                    this.user_rows
+                        .set_toggled_at(&"prompt".into(), Some(Instant::now() - Duration::from_secs(5)));
                     cx.notify();
                 };
                 transcript.update(cx, toggle);
@@ -15123,11 +15031,7 @@ mod tests {
                         transcript.pinned = true;
                         transcript.spring_kick = true;
                         transcript.own_turn_last_tick = Some(Instant::now());
-                        transcript
-                            .user_folds
-                            .entry("prompt".into())
-                            .or_default()
-                            .open = Some(open);
+                        transcript.user_rows.set_open(&"prompt".into(), open);
 
                         // No row bounds yet: ownership must transfer even if
                         // geometry is unavailable during a list remeasurement.
@@ -15147,7 +15051,7 @@ mod tests {
                         assert!(transcript.own_turn_last_tick.is_none());
                         assert!(!transcript.pinned);
                         assert!(!transcript.spring_kick);
-                        assert_eq!(transcript.user_folds["prompt"].open, Some(!open));
+                        assert_eq!(transcript.user_rows.is_expanded(&"prompt".into()), !open);
                     }
                 }
             });
