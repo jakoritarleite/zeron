@@ -10110,6 +10110,94 @@ pub fn tool_chip(
         .into_any_element()
 }
 
+/// One tool call's accordion row: the activity rail beside a card whose header
+/// ([`chip_header`]) opens onto the caller's `body`. The caller owns the fold
+/// (`open` plus the click) and supplies the body; `body_height` is that body's
+/// measured height when open, so the card can size itself. `reveal` and
+/// `content_reveal` drive the entrance. This is the accordion zeron's transcript
+/// builds inline for a tool with a detail.
+#[allow(clippy::too_many_arguments)]
+pub fn tool_chip_accordion(
+    tool: &ToolItem,
+    open: bool,
+    body: Option<AnyElement>,
+    body_height: f32,
+    rail: bool,
+    has_predecessor: bool,
+    continues: bool,
+    content_reveal: f32,
+    connector_reveal: f32,
+    continuation_reveal: f32,
+    reveal: f32,
+    file_opener: Option<&ToolFileOpener>,
+    theme: &Theme,
+    view: gpui::EntityId,
+    on_click: Rc<dyn Fn(&mut Window, &mut gpui::App)>,
+    cx: &mut gpui::App,
+) -> AnyElement {
+    let base_row_height = if rail {
+        TOOL_TREE_ROW_HEIGHT
+    } else {
+        CHIP_HEIGHT
+    };
+    let row_height = base_row_height + if open { body_height } else { 0.0 };
+    let header = chip_header(tool, open, file_opener, theme, view, cx);
+    let card = div()
+        .my(px((base_row_height - CHIP_CARD_HEIGHT) / 2.0))
+        .when(rail, |el| el.ml(px(ACTIVITY_TEXT_GAP)))
+        .min_w_0()
+        .flex_1()
+        .flex()
+        .flex_col()
+        .overflow_hidden()
+        .when(!rail, |card| {
+            card.rounded(px(9.0))
+                .border_1()
+                .border_color(crate::theme::hairline(0.07))
+                .bg(crate::theme::ink(0.03))
+        })
+        .child(
+            div()
+                .id(SharedString::from(format!("{}#d0", tool.part_id)))
+                .h(px(if rail { CHIP_CARD_HEIGHT } else { CHIP_HEADER_HEIGHT }))
+                .flex_none()
+                .flex()
+                .items_center()
+                .cursor_pointer()
+                .on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    on_click(window, cx);
+                })
+                .child(header),
+        )
+        .children(body)
+        .h(px(row_height - base_row_height + CHIP_CARD_HEIGHT));
+    let card = div().min_w_0().flex_1().child(card);
+    let row = div()
+        .w_full()
+        .flex_none()
+        .flex()
+        .flex_row()
+        .when(rail, |row| {
+            row.child(activity_rail(
+                tool,
+                has_predecessor,
+                continues,
+                connector_reveal,
+                continuation_reveal,
+                base_row_height,
+                theme,
+            ))
+        })
+        .child(card.when(rail && content_reveal < 1.0, |card| {
+            card.relative()
+                .top(px(4.0 * (1.0 - content_reveal)))
+                .opacity(content_reveal)
+        }))
+        .into_any_element();
+    reveal_tool_row(row, row_height, reveal)
+}
+
 /// A spawn chip: same card as [`tool_chip`], but the WHOLE card is the
 /// "open the subagent tab" click (open-arrow tile in the trailing slot).
 /// No accordion — an inline body would only repeat the subagent's own
