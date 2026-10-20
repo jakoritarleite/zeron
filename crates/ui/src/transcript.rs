@@ -2357,7 +2357,9 @@ pub fn format_elapsed(secs: i64) -> String {
     }
 }
 
-fn worked_for_label(secs: i64) -> String {
+/// The header's settled-work label ("Worked for 5m 10s"), for a shell that
+/// stamps its own duration onto [`ToolGroupHeader::worked`].
+pub fn worked_for_label(secs: i64) -> String {
     format!("Worked for {}", format_elapsed(secs))
 }
 
@@ -3146,7 +3148,10 @@ fn tool_title_shimmer_amount(x: f32, phase: f32) -> f32 {
         .fold(0.0, f32::max)
 }
 
-fn tool_title_shimmer_phase(start: Instant, now: Instant) -> f32 {
+/// The live title shimmer's phase at `now`, from the instant the group started
+/// working: `0.0..1.0`, cycling every [`TOOL_GROUP_SHIMMER_DURATION`]. A shell
+/// that owns its groups feeds this to [`ToolGroupHeader::shimmer_phase`].
+pub fn tool_title_shimmer_phase(start: Instant, now: Instant) -> f32 {
     let elapsed = now.checked_duration_since(start).unwrap_or_default();
     (elapsed.as_secs_f32() / TOOL_GROUP_SHIMMER_DURATION.as_secs_f32()).fract()
 }
