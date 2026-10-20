@@ -1174,6 +1174,7 @@ pub fn image_strip(
         strip = strip.child(
             div()
                 .id(SharedString::from(format!("image-strip-{ix}")))
+                .debug_selector(|| format!("image-strip-{ix}"))
                 .w(px(ATT_THUMB_W))
                 .h(px(ATT_THUMB_H))
                 .flex_none()
@@ -1222,7 +1223,8 @@ pub fn generated_image_card(
     let click_image = image.clone();
     let click_name = name.clone();
     div()
-        .id(id)
+        .id(id.clone())
+        .debug_selector(move || id.to_string())
         .flex()
         .flex_col()
         .max_w(px(512.0))
@@ -2118,5 +2120,78 @@ mod read_side_render_tests {
 
         let (_view, window) = cx.add_window_view(|_, _| CardProbe);
         window.update(|window, cx| window.draw(cx).clear());
+    }
+
+    /// The click seam hands the caller exactly what it needs to raise its own
+    /// preview: the file name for a thumbnail, the caption for a card (and the
+    /// decoded image either way).
+    #[gpui::test]
+    fn clicking_hands_over_the_name_and_image(cx: &mut gpui::TestAppContext) {
+        use std::cell::RefCell;
+
+        let seen: std::rc::Rc<RefCell<Vec<String>>> = Default::default();
+
+        struct StripProbe {
+            paths: Vec<String>,
+            seen: std::rc::Rc<RefCell<Vec<String>>>,
+        }
+        impl gpui::Render for StripProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                let seen = self.seen.clone();
+                image_strip(
+                    &self.paths,
+                    |_| Some(thumb()),
+                    move |name, _, _, _| {
+                        seen.borrow_mut().push(name.to_string());
+                    },
+                )
+                .unwrap_or_else(|| gpui::Empty.into_any_element())
+            }
+        }
+
+        let (_view, window) = cx.add_window_view(|_, _| StripProbe {
+            paths: vec!["/shots/a.png".to_string()],
+            seen: seen.clone(),
+        });
+        window.update(|window, cx| window.draw(cx).clear());
+        let thumbnail = window
+            .debug_bounds("image-strip-0")
+            .expect("a thumbnail is clickable");
+        window.simulate_click(thumbnail.center(), gpui::Modifiers::default());
+
+        struct CardProbe(std::rc::Rc<RefCell<Vec<String>>>);
+        impl gpui::Render for CardProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                let seen = self.0.clone();
+                generated_image_card(
+                    "generated-image",
+                    thumb(),
+                    "generated.png",
+                    &crate::theme::Theme::dark(),
+                    move |name, _image, _, _| seen.borrow_mut().push(name.to_string()),
+                )
+            }
+        }
+
+        let (_view, window) = cx.add_window_view(|_, _| CardProbe(seen.clone()));
+        window.update(|window, cx| window.draw(cx).clear());
+        let card = window
+            .debug_bounds("generated-image")
+            .expect("the card is clickable");
+        window.simulate_click(card.center(), gpui::Modifiers::default());
+
+        assert_eq!(
+            *seen.borrow(),
+            vec!["a.png".to_string(), "generated.png".to_string()],
+            "a thumbnail reports its file name, a card its caption"
+        );
     }
 }
