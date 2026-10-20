@@ -91,6 +91,7 @@ mod sidebar_pins;
 mod sidebar_sections;
 mod search_warm;
 pub(crate) mod spaces;
+pub use command_palette::palette_section_header;
 pub use spaces::{
     SIDEBAR_DISCLOSURE_HEADER_HEIGHT, sidebar_count_badge, sidebar_disclosure_header,
     sidebar_header_glyph,

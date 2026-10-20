@@ -1295,7 +1295,7 @@ impl Shell {
 
 /// A section's title, in the sidebar's secondary text style, with its
 /// search status trailing.
-fn palette_section_header(
+pub fn palette_section_header(
     theme: &Theme,
     title: &'static str,
     status: Option<SharedString>,
