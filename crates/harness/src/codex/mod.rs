@@ -2363,7 +2363,8 @@ mod mcp_injection_tests {
             env: [("ZERON_CHAT_ID".to_owned(), "chat-1".to_owned())]
                 .into_iter()
                 .collect(),
-        };
+            exclusive: false,
+};
         let overrides: serde_json::Map<String, Value> =
             codex_mcp_overrides(&mcp).into_iter().collect();
         assert_eq!(overrides["mcp_servers.zeron.command"], "/opt/zeron/zeron");

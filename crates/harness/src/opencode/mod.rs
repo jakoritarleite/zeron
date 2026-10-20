@@ -618,6 +618,7 @@ impl Server {
         startup: Duration,
         mcp: Option<&zeron_proto::McpServer>,
     ) -> Result<Self, HarnessError> {
+        let exclusive = mcp.is_some_and(|mcp| mcp.exclusive);
         let port = free_localhost_port().ok_or_else(|| {
             HarnessError::Protocol("no free localhost port for opencode serve".into())
         })?;
@@ -643,12 +644,18 @@ impl Server {
                     } else {
                         Protocol::V1
                     };
+                    let disabled = if exclusive {
+                        inherited_mcp_servers(cwd)
+                    } else {
+                        Vec::new()
+                    };
                     cmd.env(
                         "OPENCODE_CONFIG_CONTENT",
                         mcp_config(
                             std::env::var("OPENCODE_CONFIG_CONTENT").ok().as_deref(),
                             mcp,
                             protocol,
+                            &disabled,
                         )?,
                     );
                 }
@@ -4692,6 +4699,7 @@ fn mcp_config(
     inherited: Option<&str>,
     mcp: &zeron_proto::McpServer,
     protocol: Protocol,
+    disabled: &[(String, Value)],
 ) -> Result<String, HarnessError> {
     let mut config: Value = match inherited.filter(|s| !s.trim().is_empty()) {
         Some(raw) => deser_hjson::from_str(raw).map_err(|_| {
@@ -4726,12 +4734,163 @@ fn mcp_config(
         Protocol::V2 => server["disabled"] = json!(false),
     }
     servers.insert(mcp.name.clone(), server);
+    // A host that owns every tool disables the servers its user configured:
+    // keep each entry's own shape (command/url/…) and flip the flag the
+    // generation understands, so the final layer is unambiguous.
+    for (name, entry) in disabled {
+        if name == &mcp.name {
+            continue;
+        }
+        let Some(entry) = entry.as_object().cloned() else {
+            continue;
+        };
+        let mut entry = Value::Object(entry);
+        match protocol {
+            Protocol::V1 => entry["enabled"] = json!(false),
+            Protocol::V2 => entry["disabled"] = json!(true),
+        }
+        servers.insert(name.clone(), entry);
+    }
     Ok(config.to_string())
+}
+
+/// The MCP servers a run would inherit from opencode's own config layers, with
+/// their configured shape: the custom file (`OPENCODE_CONFIG`), the global
+/// file, project files up to the git root, and the macOS managed file. Remote
+/// (`.well-known`) config is not reachable from here.
+fn inherited_mcp_servers(cwd: Option<&str>) -> Vec<(String, Value)> {
+    mcp_servers_in(&config_layers(cwd))
+}
+
+/// The MCP servers defined by the given config files, later files winning.
+fn mcp_servers_in(paths: &[std::path::PathBuf]) -> Vec<(String, Value)> {
+    let mut servers: Vec<(String, Value)> = Vec::new();
+    for path in paths {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = deser_hjson::from_str::<Value>(&text) else {
+            continue;
+        };
+        let Some(mcp) = value.get("mcp").and_then(Value::as_object) else {
+            continue;
+        };
+        // v2 nests the servers under `servers`; v1 keeps them at `mcp`.
+        let map = mcp
+            .get("servers")
+            .and_then(Value::as_object)
+            .unwrap_or(mcp);
+        for (name, entry) in map {
+            if !entry.is_object() {
+                continue;
+            }
+            servers.retain(|(known, _)| known != name);
+            servers.push((name.clone(), entry.clone()));
+        }
+    }
+    servers
+}
+
+/// The config files opencode merges, lowest precedence the caller cares about
+/// first. A file that does not exist is simply skipped by the reader.
+fn config_layers(cwd: Option<&str>) -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(custom) = std::env::var_os("OPENCODE_CONFIG") {
+        paths.push(std::path::PathBuf::from(custom));
+    }
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| std::path::PathBuf::from(home).join(".config"))
+        });
+    if let Some(home) = config_home {
+        for name in ["opencode.json", "opencode.jsonc"] {
+            paths.push(home.join("opencode").join(name));
+        }
+    }
+    if let Some(cwd) = cwd {
+        let mut dir = Some(std::path::Path::new(cwd));
+        while let Some(current) = dir {
+            for name in ["opencode.json", "opencode.jsonc"] {
+                paths.push(current.join(name));
+            }
+            if current.join(".git").exists() {
+                break;
+            }
+            dir = current.parent();
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        for name in ["opencode.json", "opencode.jsonc"] {
+            paths.push(
+                std::path::PathBuf::from("/Library/Application Support/opencode").join(name),
+            );
+        }
+    }
+    paths
 }
 
 #[cfg(test)]
 mod mcp_injection_tests {
     use super::*;
+
+    /// A host that owns every tool turns the user's own MCP servers off in the
+    /// final config layer, keeping each entry's shape so the generation's flag
+    /// is all that changes.
+    #[test]
+    fn exclusive_runs_disable_the_users_own_servers() {
+        let fixture = tempfile::tempdir().unwrap();
+        let project = fixture.path().join("opencode.json");
+        std::fs::write(
+            &project,
+            r#"{
+              "mcp": {
+                "ai-memory": { "type": "local", "command": ["npx", "ai-memory"] },
+                "jira": { "type": "remote", "url": "https://jira.example/mcp" }
+              }
+            }"#,
+        )
+        .unwrap();
+        let inherited = mcp_servers_in(&[project]);
+        assert_eq!(inherited.len(), 2, "both user servers are known");
+
+        let mcp = zeron_proto::McpServer {
+            name: "zot".into(),
+            command: "/zot".into(),
+            args: vec!["mcp".into()],
+            env: Default::default(),
+            exclusive: false,
+};
+        for protocol in [Protocol::V1, Protocol::V2] {
+            let config: Value =
+                serde_json::from_str(&mcp_config(None, &mcp, protocol, &inherited).unwrap())
+                    .unwrap();
+            let servers = if protocol == Protocol::V1 {
+                &config["mcp"]
+            } else {
+                &config["mcp"]["servers"]
+            };
+            assert!(servers["zot"].is_object(), "the host's server is present");
+            match protocol {
+                Protocol::V1 => {
+                    assert_eq!(servers["zot"]["enabled"], true);
+                    assert_eq!(servers["ai-memory"]["enabled"], false);
+                    assert_eq!(servers["jira"]["enabled"], false);
+                }
+                Protocol::V2 => {
+                    assert_eq!(servers["zot"]["disabled"], false);
+                    assert_eq!(servers["ai-memory"]["disabled"], true);
+                    assert_eq!(servers["jira"]["disabled"], true);
+                }
+            }
+            assert_eq!(
+                servers["jira"]["url"], "https://jira.example/mcp",
+                "the entry keeps its shape"
+            );
+        }
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -4766,7 +4925,8 @@ http.createServer((req, res) => {{
                 command: "/path with spaces/zeron".into(),
                 args: vec!["mcp".into()],
                 env: [("ZERON_CHAT_ID".into(), "first".into())].into(),
-            };
+                exclusive: false,
+};
             let mut second = first.clone();
             second.env.insert("ZERON_CHAT_ID".into(), "second".into());
             let mut a = Server::spawn(
@@ -4824,7 +4984,8 @@ http.createServer((req, res) => {
             command: "zeron".into(),
             args: vec!["mcp".into()],
             env: Default::default(),
-        };
+            exclusive: false,
+};
         let mut server = Server::spawn(
             &exe,
             fixture.path().to_str(),
@@ -4881,7 +5042,8 @@ if (process.argv.includes('--version')) {{
             command: "zeron".into(),
             args: vec!["mcp".into()],
             env: Default::default(),
-        };
+            exclusive: false,
+};
         for _ in 0..2 {
             let mut server = Server::spawn(
                 &exe,
@@ -4907,7 +5069,8 @@ if (process.argv.includes('--version')) {{
             command: "/path with spaces/zeron".into(),
             args: vec!["mcp".into()],
             env: [("ZERON_CHAT_ID".into(), "first".into())].into(),
-        };
+            exclusive: false,
+};
         for protocol in [Protocol::V1, Protocol::V2] {
             let inherited = match protocol {
                 Protocol::V1 => {
@@ -4918,11 +5081,11 @@ if (process.argv.includes('--version')) {{
                 }
             };
             let first: Value =
-                serde_json::from_str(&mcp_config(Some(inherited), &mcp, protocol).unwrap())
+                serde_json::from_str(&mcp_config(Some(inherited), &mcp, protocol, &[]).unwrap())
                     .unwrap();
             mcp.env.insert("ZERON_CHAT_ID".into(), "second".into());
             let second: Value =
-                serde_json::from_str(&mcp_config(Some(inherited), &mcp, protocol).unwrap())
+                serde_json::from_str(&mcp_config(Some(inherited), &mcp, protocol, &[]).unwrap())
                     .unwrap();
             assert_eq!(first["model"], "keep");
             let pointer = if protocol == Protocol::V1 {
@@ -4948,7 +5111,7 @@ if (process.argv.includes('--version')) {{
                 assert!(servers["zeron"].get("enabled").is_none());
             }
             for invalid in ["[]", "{", r#"{"mcp":false}"#] {
-                assert!(mcp_config(Some(invalid), &mcp, protocol).is_err());
+                assert!(mcp_config(Some(invalid), &mcp, protocol, &[]).is_err());
             }
             mcp.env.insert("ZERON_CHAT_ID".into(), "first".into());
         }

@@ -1497,7 +1497,8 @@ mod mcp_injection_tests {
             env: [("ZERON_CHAT_ID".to_owned(), "chat-1".to_owned())]
                 .into_iter()
                 .collect(),
-        };
+            exclusive: false,
+};
         let parsed: Value = serde_json::from_str(&mcp_config_arg(&mcp)).unwrap();
         assert_eq!(parsed["mcpServers"]["zeron"]["command"], "/opt/zeron/zeron");
         assert_eq!(

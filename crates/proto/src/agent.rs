@@ -266,6 +266,12 @@ pub struct McpServer {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
+    /// This is the only MCP server the session may use: whatever the user
+    /// configured for the harness itself is disabled for the run. A host whose
+    /// policy owns every tool the agent may call sets it; an old host leaves it
+    /// false and the user's own servers stay as configured.
+    #[serde(default)]
+    pub exclusive: bool,
 }
 
 /// Isolated-worktree directive riding [`RunRequest`]. The worktree is created

@@ -6320,7 +6320,8 @@ mod mcp_injection_tests {
             env: [("ZERON_IPC_PORT".to_owned(), "27654".to_owned())]
                 .into_iter()
                 .collect(),
-        };
+            exclusive: false,
+};
         let servers = acp_mcp_servers(Some(&mcp));
         assert_eq!(
             servers,
