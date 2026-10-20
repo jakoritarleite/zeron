@@ -69,7 +69,7 @@ pub mod settings;
 pub mod shell;
 pub mod sound;
 pub mod state;
-pub(crate) mod surface_chrome;
+pub mod surface_chrome;
 pub mod syntax_cache;
 pub mod terminal;
 pub mod todo_panel;

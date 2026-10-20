@@ -73,11 +73,9 @@ pub(crate) fn tab_frame(
         .when(selected, |el| el.bg(crate::theme::wash(0.10)))
 }
 
-pub(crate) fn tab(
-    id: impl Into<gpui::ElementId>,
-    selected: bool,
-    theme: &Theme,
-) -> gpui::Stateful<Div> {
+/// A neutral navigation chip: the right-panel strip, the PR board and a
+/// palette's tabs all wear it, so a tab looks the same wherever it appears.
+pub fn tab(id: impl Into<gpui::ElementId>, selected: bool, theme: &Theme) -> gpui::Stateful<Div> {
     tab_frame(id, selected, theme).when(!selected, |el| {
         el.hover(|style| style.bg(crate::theme::wash(0.06)))
     })
