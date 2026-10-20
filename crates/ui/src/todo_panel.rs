@@ -16,8 +16,8 @@ use std::ops::Range;
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, Context, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, Styled, Window, div, prelude::*, px,
+    AnyElement, App, Context, InteractiveElement as _, IntoElement, ParentElement as _,
+    SharedString, StatefulInteractiveElement as _, Styled, Window, div, prelude::*, px,
 };
 
 use zeron_doc::{MessagePart, MessageRole, SessionMessageEntry};
@@ -54,15 +54,16 @@ pub(crate) fn latest_todo(entries: &[SessionMessageEntry]) -> Option<Vec<TodoIte
     (!items.is_empty()).then(|| items.clone())
 }
 
-/// What the collapsed header reports.
+/// What the collapsed header reports: the progress count, the item being
+/// worked on, and the next one due. Cheap to copy; computed once per frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TodoSummary {
-    pub total: usize,
-    pub done: usize,
+pub struct TodoSummary {
+    total: usize,
+    done: usize,
     /// First in-progress item.
-    pub active: Option<usize>,
+    active: Option<usize>,
     /// First item not yet completed.
-    pub next: Option<usize>,
+    next: Option<usize>,
 }
 
 impl TodoSummary {
@@ -88,6 +89,17 @@ impl TodoSummary {
         summary
     }
 
+    /// The list's length.
+    pub fn total(&self) -> usize {
+        self.total
+    }
+
+    /// How many items are completed.
+    pub fn done(&self) -> usize {
+        self.done
+    }
+
+    /// Whether the list is non-empty and every item is done.
     pub fn finished(&self) -> bool {
         self.total > 0 && self.done == self.total
     }
@@ -174,10 +186,16 @@ fn signature(items: &[TodoItem]) -> u64 {
     hasher.finish()
 }
 
-/// Per-chat presentation state. In memory only — like the right-pane flags in
+/// Per-chat presentation state: the expand override, the fold choices and the
+/// dismissal. In memory only — like the right-pane flags in
 /// `shell::SessionPanels` it lasts for the app run, not across restarts.
+///
+/// A caller that is not zeron's composer owns one of these per chat, calls
+/// [`TodoPanelState::observe`] each frame with “done and idle”, then forwards
+/// the panel's three interactions to [`TodoPanelState::toggle`],
+/// [`TodoPanelState::toggle_fold`] and [`TodoPanelState::dismiss`].
 #[derive(Debug, Default, Clone)]
-pub(crate) struct TodoPanelState {
+pub struct TodoPanelState {
     /// The user's explicit choice; `None` follows the automatic rule: open
     /// while work remains, compact once everything is done.
     expanded: Option<bool>,
@@ -294,64 +312,56 @@ impl Composer {
         };
         let summary = TodoSummary::of(&items);
         let settled = summary.finished() && !live;
+        let finished = summary.finished();
 
+        // The state machine is the caller's: feeding it the frame's facts is
+        // what tidies a finished list once the turn settles.
         let panel = self.todo_panels.entry(chat_id.clone()).or_default();
         panel.observe(settled);
-        if panel.is_dismissed(&items) {
-            return None;
-        }
-        let expanded = panel.is_expanded(summary.finished());
-        let (show_earlier, show_later, epoch) = (panel.show_earlier, panel.show_later, panel.epoch);
 
         let theme = Theme::of(cx).clone();
         let view = cx.entity_id();
-        // Dismissable whenever the turn is idle, finished or not.
-        let header = self.todo_header(&chat_id, &items, summary, expanded, !live, &theme, cx);
-
-        let surface =
-            crate::queue::queue_panel_surface(&theme, cx.has_active_drag()).child(header);
-        let surface = if expanded {
-            let list = div().flex().flex_col().children(
-                rows(&items, show_earlier, show_later)
-                    .into_iter()
-                    .map(|row| match row {
-                        TodoRow::Item(ix) => todo_item_row(ix, &items[ix], live, &theme, view, cx),
-                        TodoRow::Fold { side, count, open } => {
-                            self.todo_fold_row(&chat_id, side, count, open, &theme, cx)
-                        }
-                    }),
-            );
-            // Same fade-and-scroll treatment as the queue's rows; a long
-            // expanded fold scrolls instead of pushing the transcript up.
-            let rows = crate::edge_fade::edge_faded(
-                Theme::TRANSCRIPT_FADE_BAND,
-                true,
-                true,
-                div()
-                    .id("todo-panel-rows")
-                    .max_h(window.viewport_size().height * 0.3)
-                    .overflow_y_scroll()
-                    .track_scroll(&self.todo_scroll)
-                    .child(list),
-            )
-            // The ramp ends at the clip edge; glyphs fade per pixel.
-            .fade_overflow_y(&self.todo_scroll);
-            surface.child(
-                div()
-                    .mt(px(2.0))
-                    // The tray's lowest strip hides behind the composer; keep
-                    // the last row clear of that edge.
-                    .pb(px(6.0))
-                    .child(rows)
-                    .with_animation(
-                        SharedString::from(format!("todo-rows-{epoch}")),
-                        motion::FADE_QUICK.animation(),
-                        |el, t| el.opacity(t),
-                    ),
-            )
-        } else {
-            surface
-        };
+        let entity = cx.entity().downgrade();
+        let (toggle_entity, dismiss_entity, fold_entity) = (entity.clone(), entity.clone(), entity);
+        let (toggle_chat, dismiss_chat, fold_chat) = (chat_id.clone(), chat_id.clone(), chat_id);
+        let dismiss_items = items.clone();
+        let surface = todo_panel(
+            &items,
+            panel,
+            live,
+            &theme,
+            view,
+            &self.todo_scroll,
+            window,
+            move |_, cx| {
+                let _ = toggle_entity.update(cx, |this, cx| {
+                    this.todo_panels
+                        .entry(toggle_chat.clone())
+                        .or_default()
+                        .toggle(finished);
+                    cx.notify();
+                });
+            },
+            move |_, cx| {
+                let _ = dismiss_entity.update(cx, |this, cx| {
+                    this.todo_panels
+                        .entry(dismiss_chat.clone())
+                        .or_default()
+                        .dismiss(&dismiss_items);
+                    cx.notify();
+                });
+            },
+            move |side, _, cx| {
+                let _ = fold_entity.update(cx, |this, cx| {
+                    this.todo_panels
+                        .entry(fold_chat.clone())
+                        .or_default()
+                        .toggle_fold(side);
+                    cx.notify();
+                });
+            },
+            cx,
+        )?;
 
         let inset = if below_queue {
             SIDE_INSET * 2.0
@@ -372,225 +382,290 @@ impl Composer {
                 .into_any_element(),
         )
     }
+}
 
-    /// `Todo · 2/5` and what is being worked on; one button that toggles the
-    /// list, plus a dismiss while the turn is idle.
-    #[allow(clippy::too_many_arguments)]
-    fn todo_header(
-        &self,
-        chat_id: &str,
-        items: &[TodoItem],
-        summary: TodoSummary,
-        expanded: bool,
-        dismissable: bool,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let accent = theme.accent;
-        let label = if expanded {
-            "Collapse todo list"
-        } else {
-            "Expand todo list"
-        };
-        let headline: Option<(SharedString, gpui::Hsla)> = if summary.finished() {
-            Some(("All done".into(), theme.text_faint))
-        } else {
-            summary
-                .headline()
-                .map(|ix| (items[ix].text.clone().into(), theme.text_muted))
-        };
+/// The checklist tray for `items`: the header, then — while expanded — the
+/// list. `None` when there is no list, or the user dismissed this exact one;
+/// the caller has already fed [`TodoPanelState::observe`] this frame.
+///
+/// `live` is “a turn is running”: it animates the in-progress glyph, and only
+/// an idle list may be dismissed. `view` is the caller's entity, where the
+/// spinner registers its frames; `scroll` keeps a long expanded list's
+/// position. The dock — inset, frost, the negative margin that tucks the tray
+/// behind the composer — stays with the caller.
+#[allow(clippy::too_many_arguments)]
+pub fn todo_panel(
+    items: &[TodoItem],
+    state: &TodoPanelState,
+    live: bool,
+    theme: &Theme,
+    view: gpui::EntityId,
+    scroll: &gpui::ScrollHandle,
+    window: &Window,
+    on_toggle: impl Fn(&mut Window, &mut App) + 'static,
+    on_dismiss: impl Fn(&mut Window, &mut App) + 'static,
+    on_toggle_fold: impl Fn(FoldSide, &mut Window, &mut App) + 'static,
+    cx: &mut App,
+) -> Option<AnyElement> {
+    if items.is_empty() {
+        return None;
+    }
+    if state.is_dismissed(items) {
+        return None;
+    }
+    let summary = TodoSummary::of(items);
+    let expanded = state.is_expanded(summary.finished());
+    let surface = crate::queue::queue_panel_surface(theme, cx.has_active_drag()).child(
+        todo_header(summary, items, expanded, live, theme, on_toggle, on_dismiss),
+    );
+    if !expanded {
+        return Some(surface.into_any_element());
+    }
 
-        let finished = summary.finished();
-        let toggle_chat = chat_id.to_owned();
-        let toggle =
-            div()
-                .id("todo-panel-toggle")
-                .role(gpui::Role::Button)
-                .aria_label(label)
-                .flex_1()
-                .min_w_0()
-                .h(px(HEADER_HEIGHT))
-                .px(px(ROW_PAD_X))
-                .rounded(px(ROW_RADIUS))
-                .flex()
-                .items_center()
-                .gap(px(8.0))
-                .cursor_pointer()
-                .hover(|s| s.bg(theme.element_hover))
-                .tab_index(0)
-                .focus_visible(move |s| s.bg(accent.opacity(0.14)))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.todo_panels
-                        .entry(toggle_chat.clone())
-                        .or_default()
-                        .toggle(finished);
-                    cx.notify();
-                }))
-                .tooltip(crate::settings::widgets::text_tooltip(label))
-                .tooltip_show_delay(Duration::from_millis(350))
-                .child(
-                    icon(if summary.finished() {
-                        icons::CHECK
-                    } else {
-                        icons::CHECKLIST
-                    })
-                    .size(px(14.0))
-                    .text_color(if summary.finished() {
-                        theme.success
-                    } else {
-                        theme.text_muted
-                    }),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .flex()
-                        .items_baseline()
-                        .gap(px(6.0))
-                        .text_size(px(TEXT_SIZE))
-                        .child(
-                            div()
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(theme.text)
-                                .child("Todo"),
-                        )
-                        .child(div().text_color(theme.text_faint).child(SharedString::from(
-                            format!("{}/{}", summary.done, summary.total),
-                        ))),
-                )
-                // The expanded list already names every item; the headline is the
-                // collapsed state's whole point.
-                .when(!expanded, |el| {
-                    el.when_some(headline, |el, (text, color)| {
-                        el.child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(px(TEXT_SIZE))
-                                .text_color(color)
-                                .child(text),
-                        )
-                    })
-                })
-                .when(expanded, |el| el.child(div().flex_1()))
-                .child(
-                    icon(if expanded {
-                        icons::ALT_ARROW_DOWN
-                    } else {
-                        icons::ALT_ARROW_UP
-                    })
-                    .size(px(13.0))
-                    .text_color(theme.text_muted.opacity(0.7)),
-                );
-
-        let dismiss_chat = chat_id.to_owned();
-        let dismiss_items = items.to_vec();
+    let folds = std::rc::Rc::new(on_toggle_fold);
+    let list = div().flex().flex_col().children(
+        rows(items, state.show_earlier, state.show_later)
+            .into_iter()
+            .map(|row| match row {
+                TodoRow::Item(ix) => todo_item_row(ix, &items[ix], live, theme, view, cx),
+                TodoRow::Fold { side, count, open } => {
+                    todo_fold_row(side, count, open, theme, folds.clone())
+                }
+            }),
+    );
+    // Same fade-and-scroll treatment as the queue's rows; a long expanded fold
+    // scrolls instead of pushing the transcript up.
+    let rows = crate::edge_fade::edge_faded(
+        Theme::TRANSCRIPT_FADE_BAND,
+        true,
+        true,
         div()
-            .flex()
-            .items_center()
-            .gap(px(2.0))
-            .child(toggle)
-            .when(dismissable, |row| {
-                row.child(
+            .id("todo-panel-rows")
+            .max_h(window.viewport_size().height * 0.3)
+            .overflow_y_scroll()
+            .track_scroll(scroll)
+            .child(list),
+    )
+    // The ramp ends at the clip edge; glyphs fade per pixel.
+    .fade_overflow_y(scroll);
+    Some(
+        surface
+            .child(
+                div()
+                    .mt(px(2.0))
+                    // The tray's lowest strip hides behind the composer; keep
+                    // the last row clear of that edge.
+                    .pb(px(6.0))
+                    .child(rows)
+                    .with_animation(
+                        SharedString::from(format!("todo-rows-{}", state.epoch)),
+                        motion::FADE_QUICK.animation(),
+                        |el, t| el.opacity(t),
+                    ),
+            )
+            .into_any_element(),
+    )
+}
+
+/// `Todo · 2/5` and what is being worked on; one button that toggles the list,
+/// plus a dismiss while the turn is idle.
+fn todo_header(
+    summary: TodoSummary,
+    items: &[TodoItem],
+    expanded: bool,
+    live: bool,
+    theme: &Theme,
+    on_toggle: impl Fn(&mut Window, &mut App) + 'static,
+    on_dismiss: impl Fn(&mut Window, &mut App) + 'static,
+) -> AnyElement {
+    let accent = theme.accent;
+    let label = if expanded {
+        "Collapse todo list"
+    } else {
+        "Expand todo list"
+    };
+    let headline: Option<(SharedString, gpui::Hsla)> = if summary.finished() {
+        Some(("All done".into(), theme.text_faint))
+    } else {
+        summary
+            .headline()
+            .map(|ix| (items[ix].text.clone().into(), theme.text_muted))
+    };
+
+    let toggle = div()
+        .id("todo-panel-toggle")
+        .debug_selector(|| "todo-panel-toggle".to_string())
+        .role(gpui::Role::Button)
+        .aria_label(label)
+        .flex_1()
+        .min_w_0()
+        .h(px(HEADER_HEIGHT))
+        .px(px(ROW_PAD_X))
+        .rounded(px(ROW_RADIUS))
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .cursor_pointer()
+        .hover(|s| s.bg(theme.element_hover))
+        .tab_index(0)
+        .focus_visible(move |s| s.bg(accent.opacity(0.14)))
+        .on_click(move |_, window, cx| on_toggle(window, cx))
+        .tooltip(crate::settings::widgets::text_tooltip(label))
+        .tooltip_show_delay(Duration::from_millis(350))
+        .child(
+            icon(if summary.finished() {
+                icons::CHECK
+            } else {
+                icons::CHECKLIST
+            })
+            .size(px(14.0))
+            .text_color(if summary.finished() {
+                theme.success
+            } else {
+                theme.text_muted
+            }),
+        )
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .items_baseline()
+                .gap(px(6.0))
+                .text_size(px(TEXT_SIZE))
+                .child(
                     div()
-                        .id("todo-panel-dismiss")
-                        .role(gpui::Role::Button)
-                        .aria_label("Dismiss todo list")
-                        .size(px(ACTION_SIZE))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(5.0))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(theme.element_hover))
-                        .tab_index(0)
-                        .focus_visible(move |s| s.bg(accent.opacity(0.18)))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.todo_panels
-                                .entry(dismiss_chat.clone())
-                                .or_default()
-                                .dismiss(&dismiss_items);
-                            cx.notify();
-                        }))
-                        .tooltip(crate::settings::widgets::text_tooltip("Dismiss"))
-                        .tooltip_show_delay(Duration::from_millis(350))
-                        .child(
-                            icon(icons::CLOSE)
-                                .size(px(11.0))
-                                .text_color(theme.text_muted.opacity(0.8)),
-                        ),
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.text)
+                        .child("Todo"),
+                )
+                .child(
+                    div()
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from(format!(
+                            "{}/{}",
+                            summary.done, summary.total
+                        ))),
+                ),
+        )
+        // The expanded list already names every item; the headline is the
+        // collapsed state's whole point.
+        .when(!expanded, |el| {
+            el.when_some(headline, |el, (text, color)| {
+                el.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(TEXT_SIZE))
+                        .text_color(color)
+                        .child(text),
                 )
             })
-            .into_any_element()
-    }
-
-    /// "N earlier" / "N later": stands in for the items folded off one end of a
-    /// long list; clicking reveals them in place, clicking again hides them.
-    fn todo_fold_row(
-        &self,
-        chat_id: &str,
-        side: FoldSide,
-        count: usize,
-        open: bool,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let accent = theme.accent;
-        let noun = match side {
-            FoldSide::Earlier => "earlier",
-            FoldSide::Later => "later",
-        };
-        let text = SharedString::from(format!("{count} {noun}"));
-        let aria = format!(
-            "{} {count} {noun} items",
-            if open { "Hide" } else { "Show" }
+        })
+        .when(expanded, |el| el.child(div().flex_1()))
+        .child(
+            icon(if expanded {
+                icons::ALT_ARROW_DOWN
+            } else {
+                icons::ALT_ARROW_UP
+            })
+            .size(px(13.0))
+            .text_color(theme.text_muted.opacity(0.7)),
         );
-        // The arrow points to where the hidden items are (or, once revealed,
-        // back to where they fold away).
-        let glyph = match (side, open) {
-            (FoldSide::Earlier, false) | (FoldSide::Later, true) => icons::ALT_ARROW_UP,
-            _ => icons::ALT_ARROW_DOWN,
-        };
-        let chat_id = chat_id.to_owned();
-        div()
-            .id(SharedString::from(format!("todo-fold-{noun}")))
-            .role(gpui::Role::Button)
-            .aria_label(aria)
-            .h(px(24.0))
-            .px(px(ROW_PAD_X))
-            .rounded(px(6.0))
-            .flex()
-            .items_center()
-            .gap(px(8.0))
-            .cursor_pointer()
-            .hover(|s| s.bg(theme.element_hover))
-            .tab_index(0)
-            .focus_visible(move |s| s.bg(accent.opacity(0.14)))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.todo_panels
-                    .entry(chat_id.clone())
-                    .or_default()
-                    .toggle_fold(side);
-                cx.notify();
-            }))
-            .child(
+
+    let dismissable = !live;
+    div()
+        .flex()
+        .items_center()
+        .gap(px(2.0))
+        .child(toggle)
+        .when(dismissable, |row| {
+            row.child(
                 div()
-                    .w(px(GLYPH_SLOT))
+                    .id("todo-panel-dismiss")
+                    .role(gpui::Role::Button)
+                    .aria_label("Dismiss todo list")
+                    .size(px(ACTION_SIZE))
                     .flex_none()
                     .flex()
+                    .items_center()
                     .justify_center()
-                    .child(icon(glyph).size(px(12.0)).text_color(theme.text_faint)),
+                    .rounded(px(5.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.element_hover))
+                    .tab_index(0)
+                    .focus_visible(move |s| s.bg(accent.opacity(0.18)))
+                    .on_click(move |_, window, cx| on_dismiss(window, cx))
+                    .tooltip(crate::settings::widgets::text_tooltip("Dismiss"))
+                    .tooltip_show_delay(Duration::from_millis(350))
+                    .child(
+                        icon(icons::CLOSE)
+                            .size(px(11.0))
+                            .text_color(theme.text_muted.opacity(0.8)),
+                    ),
             )
-            .child(
-                div()
-                    .text_size(px(11.5))
-                    .text_color(theme.text_faint)
-                    .child(text),
-            )
-            .into_any_element()
-    }
+        })
+        .into_any_element()
+}
+
+/// A fold row's click handler, shared by both edges of the list.
+type FoldToggle = std::rc::Rc<dyn Fn(FoldSide, &mut Window, &mut App)>;
+
+/// “N earlier” / “N later”: stands in for the items folded off one end of a
+/// long list; clicking reveals them in place, clicking again hides them.
+fn todo_fold_row(
+    side: FoldSide,
+    count: usize,
+    open: bool,
+    theme: &Theme,
+    toggle: FoldToggle,
+) -> AnyElement {
+    let accent = theme.accent;
+    let noun = match side {
+        FoldSide::Earlier => "earlier",
+        FoldSide::Later => "later",
+    };
+    let text = SharedString::from(format!("{count} {noun}"));
+    let aria = format!(
+        "{} {count} {noun} items",
+        if open { "Hide" } else { "Show" }
+    );
+    // The arrow points to where the hidden items are (or, once revealed, back
+    // to where they fold away).
+    let glyph = match (side, open) {
+        (FoldSide::Earlier, false) | (FoldSide::Later, true) => icons::ALT_ARROW_UP,
+        _ => icons::ALT_ARROW_DOWN,
+    };
+    div()
+        .id(SharedString::from(format!("todo-fold-{noun}")))
+        .role(gpui::Role::Button)
+        .aria_label(aria)
+        .h(px(24.0))
+        .px(px(ROW_PAD_X))
+        .rounded(px(6.0))
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .cursor_pointer()
+        .hover(|s| s.bg(theme.element_hover))
+        .tab_index(0)
+        .focus_visible(move |s| s.bg(accent.opacity(0.14)))
+        .on_click(move |_, window, cx| toggle(side, window, cx))
+        .child(
+            div()
+                .w(px(GLYPH_SLOT))
+                .flex_none()
+                .flex()
+                .justify_center()
+                .child(icon(glyph).size(px(12.0)).text_color(theme.text_faint)),
+        )
+        .child(
+            div()
+                .text_size(px(11.5))
+                .text_color(theme.text_faint)
+                .child(text),
+        )
+        .into_any_element()
 }
 
 /// One checklist row: status glyph + text. Completed work recedes, the
@@ -1140,5 +1215,100 @@ mod composer_tests {
             cx,
         );
         assert!(rendered(&handle, cx));
+    }
+}
+
+#[cfg(test)]
+mod public_seam_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn items(spec: &str) -> Vec<TodoItem> {
+        spec.chars()
+            .enumerate()
+            .map(|(i, c)| {
+                TodoItem::new(
+                    format!("item {i}"),
+                    match c {
+                        'x' => TodoStatus::Completed,
+                        '>' => TodoStatus::InProgress,
+                        _ => TodoStatus::Pending,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// The panel outside zeron's composer: the caller owns the state and the
+    /// scroll, and the three interactions arrive as plain callbacks.
+    #[gpui::test]
+    fn a_caller_owned_panel_draws_and_toggles(cx: &mut gpui::TestAppContext) {
+        struct Probe {
+            items: Vec<TodoItem>,
+            state: TodoPanelState,
+            scroll: gpui::ScrollHandle,
+            toggles: std::rc::Rc<Cell<usize>>,
+        }
+        impl gpui::Render for Probe {
+            fn render(
+                &mut self,
+                window: &mut gpui::Window,
+                cx: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                let toggles = self.toggles.clone();
+                todo_panel(
+                    &self.items,
+                    &self.state,
+                    false,
+                    &Theme::dark(),
+                    cx.entity_id(),
+                    &self.scroll,
+                    window,
+                    move |_, _| toggles.set(toggles.get() + 1),
+                    |_, _| {},
+                    |_, _, _| {},
+                    cx,
+                )
+                .unwrap_or_else(|| gpui::Empty.into_any_element())
+            }
+        }
+
+        let toggles: std::rc::Rc<Cell<usize>> = Default::default();
+        let (view, window) = cx.add_window_view(|_, _| Probe {
+            items: items(".>x"),
+            state: TodoPanelState::default(),
+            scroll: Default::default(),
+            toggles: toggles.clone(),
+        });
+        window.update(|window, cx| window.draw(cx).clear());
+        let header = window
+            .debug_bounds("todo-panel-toggle")
+            .expect("the header toggles the list");
+        window.simulate_click(header.center(), gpui::Modifiers::default());
+        assert_eq!(toggles.get(), 1, "the caller's toggle handler ran");
+
+        // A dismissed list draws nothing, and the caller's `observe` is what
+        // decides the expand override — the panel keeps neither.
+        let items = items("xxx");
+        let mut state = TodoPanelState::default();
+        state.dismiss(&items);
+        let view = view.entity_id();
+        let hidden = window.update(|window, cx| {
+            todo_panel(
+                &items,
+                &state,
+                false,
+                &Theme::dark(),
+                view,
+                &gpui::ScrollHandle::default(),
+                window,
+                |_, _| {},
+                |_, _| {},
+                |_, _, _| {},
+                cx,
+            )
+            .is_none()
+        });
+        assert!(hidden, "a dismissed list has no tray");
     }
 }
