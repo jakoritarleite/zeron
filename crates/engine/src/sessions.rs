@@ -1589,7 +1589,8 @@ impl Inner {
             ]
             .into_iter()
             .collect(),
-        })
+    exclusive: false,
+})
     }
 
     fn workspace(&self) -> Option<crate::workspace_host::WorkspaceHost> {

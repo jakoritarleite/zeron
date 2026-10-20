@@ -695,7 +695,8 @@ async fn mcp_injection_reaches_shim_on_new_and_resumed_runs() {
             command: "/path with spaces/zeron".into(),
             args: vec!["mcp".into()],
             env: [("ZERON_CHAT_ID".into(), "origin-chat".into())].into(),
-        });
+    exclusive: false,
+});
         let (controls, _steer, _token) = controls();
         let events = run_to_first_done(&harness(), req, controls).await;
         assert!(events.contains(&AgentEvent::TextDelta {
