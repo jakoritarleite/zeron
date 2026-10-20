@@ -20,11 +20,13 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use futures::TryStreamExt as _;
 use gpui::{
-    AnyElement, BackgroundExecutor, Image, ImageFormat, SharedString, Size, div, prelude::*, px,
+    AnyElement, BackgroundExecutor, Image, ImageFormat, SharedString, Size, div, img, prelude::*,
+    px,
 };
 
 use crate::state::EngineHandle;
 use crate::theme::ink;
+use crate::transcript::{ATT_THUMB_H, ATT_THUMB_W};
 use zeron_rpc::methods;
 
 /// use-attachments.ts `MAX_ATTACHMENT_BYTES`.
@@ -1129,6 +1131,137 @@ pub fn seed_staged_alias(device_id: &str, upload_id: &str, att: &StagedAttachmen
 }
 
 // ---------------------------------------------------------------------------
+// Thumbnail strip and generated-image card (the read side, for any surface)
+// ---------------------------------------------------------------------------
+
+/// A right-aligned, wrapping row of [`ATT_THUMB_W`]×[`ATT_THUMB_H`] thumbnails,
+/// one per path `load` decodes — the read-side companion to [`lightbox`].
+///
+/// `load` is the caller's own image policy (its file cache, its device cache);
+/// the strip reads nothing itself and silently drops a path it cannot decode.
+/// `None` when no path yields an image, so a caller can omit the row entirely.
+/// `on_open` receives the path's file name (the [`name_from_path`] rule), the
+/// decoded image and the live window — the caller owns what opening means.
+pub fn image_strip(
+    paths: &[String],
+    load: impl Fn(&str) -> Option<Arc<Image>>,
+    on_open: impl Fn(SharedString, Arc<Image>, &mut gpui::Window, &mut gpui::App) + 'static,
+) -> Option<AnyElement> {
+    // Pair each decodable path with the index it keeps: the index in `paths`,
+    // not in this filtered list, so a path that fails to load never shuffles
+    // the ids of the thumbnails that follow it.
+    let mut thumbnails: Vec<(usize, SharedString, Arc<Image>)> = Vec::new();
+    for (ix, path) in paths.iter().enumerate() {
+        let Some(image) = load(path) else {
+            continue;
+        };
+        thumbnails.push((ix, name_from_path(path).into(), image));
+    }
+    if thumbnails.is_empty() {
+        return None;
+    }
+
+    let on_open = std::rc::Rc::new(on_open);
+    let mut strip = div()
+        .flex()
+        .flex_wrap()
+        .justify_end()
+        .items_start()
+        .w_full()
+        .gap(px(6.0));
+    for (ix, name, image) in thumbnails {
+        let open = on_open.clone();
+        strip = strip.child(
+            div()
+                .id(SharedString::from(format!("image-strip-{ix}")))
+                .w(px(ATT_THUMB_W))
+                .h(px(ATT_THUMB_H))
+                .flex_none()
+                .rounded(px(8.0))
+                .overflow_hidden()
+                .cursor_pointer()
+                .child(
+                    img(image.clone())
+                        // Explicit dims, not `size_full`: `img` honors the
+                        // intrinsic aspect ratio over a percent height, so a
+                        // tall photo would grow past the frame and the
+                        // rectangular clip would square its bottom corners.
+                        .w(px(ATT_THUMB_W - 2.0))
+                        .h(px(ATT_THUMB_H - 2.0))
+                        // The image rounds its own corners: the frame's
+                        // rounding only clips rectangularly.
+                        .rounded(px(7.0))
+                        .object_fit(gpui::ObjectFit::Cover),
+                )
+                .on_click(move |_, window, cx| open(name.clone(), image.clone(), window, cx)),
+        );
+    }
+    Some(strip.into_any_element())
+}
+
+/// One agent-generated image as a transcript card: zeron's 512×320 frame,
+/// aspect-scaled to the PNG's own dimensions and never upscaled, with the
+/// one-line caption under it.
+///
+/// The caller has already decoded the image, so there is no loading or error
+/// state here — it either has an image to show or does not call this. `id` is
+/// the caller's stable element id; `on_open` gets `caption` back with the
+/// image, so the caller can raise its own preview.
+pub fn generated_image_card(
+    id: impl Into<SharedString>,
+    image: Arc<Image>,
+    caption: &str,
+    theme: &crate::theme::Theme,
+    on_open: impl Fn(SharedString, Arc<Image>, &mut gpui::Window, &mut gpui::App) + 'static,
+) -> AnyElement {
+    let id: SharedString = id.into();
+    let name: SharedString = caption.to_string().into();
+    let (width, height) = crate::appshots::png_dimensions(&image.bytes).unwrap_or((512, 320));
+    let scale = (512.0 / width as f32).min(420.0 / height as f32).min(1.0);
+    let focus_color = theme.accent;
+    let click_image = image.clone();
+    let click_name = name.clone();
+    div()
+        .id(id)
+        .flex()
+        .flex_col()
+        .max_w(px(512.0))
+        .rounded(px(12.0))
+        .overflow_hidden()
+        .bg(ink(0.045))
+        .role(gpui::Role::Button)
+        .aria_label(SharedString::from(format!("Preview {caption}")))
+        .tab_index(0)
+        .cursor_pointer()
+        .focus_visible(move |style| style.border_2().border_color(focus_color))
+        .on_click(move |_, window, cx| on_open(click_name.clone(), click_image.clone(), window, cx))
+        .child(
+            div()
+                .w(px(width as f32 * scale))
+                .h(px(height as f32 * scale))
+                .max_w_full()
+                .child(
+                    img(image)
+                        .size_full()
+                        // The frame's overflow clip is rectangular; round the
+                        // image itself.
+                        .rounded(px(12.0))
+                        .object_fit(gpui::ObjectFit::Contain),
+                ),
+        )
+        .child(
+            div()
+                .w_full()
+                .truncate()
+                .p(px(8.0))
+                .text_size(px(12.0))
+                .text_color(theme.text_muted)
+                .child(name),
+        )
+        .into_any_element()
+}
+
+// ---------------------------------------------------------------------------
 // Preview lightbox (attachment-ui.tsx AttachmentPreviewDialog)
 // ---------------------------------------------------------------------------
 
@@ -1909,5 +2042,81 @@ mod generated_image_tests {
                 .is_ok()
         );
         assert!(crate::image_media::decode_raster_image(bytes, 8 * 1024 * 1024).is_err());
+    }
+}
+
+#[cfg(test)]
+mod read_side_render_tests {
+    use super::*;
+
+    /// A 1×1 transparent PNG — real bytes `Image::from_bytes` can carry, so the
+    /// draw pass paints a thumbnail instead of nothing.
+    const ONE_PIXEL_PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    fn thumb() -> Arc<Image> {
+        Arc::new(Image::from_bytes(ImageFormat::Png, ONE_PIXEL_PNG.to_vec()))
+    }
+
+    fn no_open(_name: SharedString, _image: Arc<Image>, _: &mut gpui::Window, _: &mut gpui::App) {}
+
+    #[test]
+    fn a_strip_needs_at_least_one_decodable_path() {
+        assert!(image_strip(&[], |_| Some(thumb()), no_open).is_none());
+        let paths = vec!["/shots/report.pdf".to_string()];
+        assert!(
+            image_strip(&paths, |_| None, no_open).is_none(),
+            "a path the loader refuses contributes no thumbnail"
+        );
+        assert!(
+            image_strip(&paths, |_| Some(thumb()), no_open).is_some(),
+            "one decoded path is a row"
+        );
+    }
+
+    /// Both read-side renderers survive a headless draw: the strip under a
+    /// loader that decodes every path, and the card from real PNG bytes.
+    #[gpui::test]
+    fn the_strip_and_the_card_draw_headlessly(cx: &mut gpui::TestAppContext) {
+        struct StripProbe(Vec<String>);
+        impl gpui::Render for StripProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                image_strip(&self.0, |_| Some(thumb()), no_open)
+                    .unwrap_or_else(|| gpui::Empty.into_any_element())
+            }
+        }
+
+        let paths = vec!["/shots/a.png".to_string(), "/shots/b.webp".to_string()];
+        let (_view, window) = cx.add_window_view(|_, _| StripProbe(paths));
+        window.update(|window, cx| window.draw(cx).clear());
+
+        struct CardProbe;
+        impl gpui::Render for CardProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                generated_image_card(
+                    "generated-image",
+                    thumb(),
+                    "generated.png",
+                    &crate::theme::Theme::dark(),
+                    no_open,
+                )
+            }
+        }
+
+        let (_view, window) = cx.add_window_view(|_, _| CardProbe);
+        window.update(|window, cx| window.draw(cx).clear());
     }
 }
