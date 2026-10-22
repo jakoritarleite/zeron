@@ -13296,7 +13296,7 @@ pub fn nav_history_button(
 
 /// A size-7 icon button for the main-panel header (zeron __root.tsx:
 /// `grid size-7 place-items-center rounded-md text-muted-foreground`).
-fn header_icon_button(
+pub fn header_icon_button(
     id: &'static str,
     icon_path: &'static str,
     label: &'static str,
@@ -13309,7 +13309,7 @@ fn header_icon_button(
 
 /// [`header_icon_button`] around a caller-drawn glyph (the morphing sidebar
 /// glyph).
-fn header_icon_button_with(
+pub fn header_icon_button_with(
     id: &'static str,
     glyph: impl IntoElement,
     label: &'static str,
