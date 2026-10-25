@@ -1222,6 +1222,11 @@ impl SelectOption {
         }
     }
 
+    /// The option's text.
+    pub fn label(&self) -> &SharedString {
+        &self.label
+    }
+
     /// A glyph or swatch before the label, in the row and (when selected)
     /// the trigger.
     pub fn leading(mut self, leading: impl Fn() -> AnyElement + 'static) -> Self {
