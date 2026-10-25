@@ -1519,7 +1519,7 @@ fn accent_helper(accent: AccentSelection) -> String {
     }
 }
 
-fn surface_label(surface: SurfacePreference) -> &'static str {
+pub fn surface_label(surface: SurfacePreference) -> &'static str {
     match surface {
         SurfacePreference::ThemeDefault => "Theme default",
         SurfacePreference::Frosted => "Frosted",
@@ -1552,14 +1552,18 @@ fn surface_helper(surface: SurfacePreference, resolved: SurfaceTreatment) -> Str
     }
 }
 
+/// Which corners a [`miniature`] rounds: all of it, or one half of a split
+/// preview.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Corners {
+pub enum Corners {
     All,
     Left,
     Right,
 }
 
-fn miniature(theme: &Theme, corners: Corners) -> AnyElement {
+/// A miniature of a resolved theme: the sidebar slab, the content card and a
+/// few text bars in the theme's own colors. The caller sizes it.
+pub fn miniature(theme: &Theme, corners: Corners) -> AnyElement {
     let line = theme.text.opacity(0.22);
     let strong = theme.text.opacity(0.34);
     let r = px(widgets::OPTION_CARD_RADIUS);
@@ -1662,7 +1666,9 @@ fn model_appearance(appearance: Appearance) -> zeron_theme::Appearance {
     }
 }
 
-fn palette_preview(theme: &Theme) -> gpui::Div {
+/// A small theme palette preview for a select's leading chip: the theme's
+/// surface, background and accent thirds in one rounded chip.
+pub fn palette_preview(theme: &Theme) -> gpui::Div {
     div()
         .flex_none()
         .w(px(30.0))
@@ -1853,7 +1859,9 @@ fn report_panel(theme: &Theme, report: &ImportReport) -> impl IntoElement {
     )
 }
 
-fn accent_swatch(
+/// One accent swatch: the theme default wears the accent glyph bars on its
+/// wash; presets wear their resolved accent.
+pub fn accent_swatch(
     page_theme: &Theme,
     selection: AccentSelection,
     selected: bool,

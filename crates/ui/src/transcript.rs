@@ -10044,7 +10044,7 @@ fn activity_rail(
 
 /// A clockwise ribbon contour. Nonzero fill unions intersecting contours,
 /// preserving one alpha contribution at the fork on transparent surfaces.
-fn activity_ribbon(path: &mut PathBuilder, points: &[Point<Pixels>]) {
+pub fn activity_ribbon(path: &mut PathBuilder, points: &[Point<Pixels>]) {
     let mut left = Vec::with_capacity(points.len());
     let mut right = Vec::with_capacity(points.len());
     for (ix, p) in points.iter().enumerate() {
