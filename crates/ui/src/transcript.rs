@@ -9597,7 +9597,10 @@ fn chip_header_row(
         ToolItemKind::Note => ("Wrote", note_chip_detail(tool)),
         ToolItemKind::Call => tool_chip_content(&tool.call),
     };
-    let activity = !is_agent_tool(tool);
+    // A live call may be reconstructed without its original arguments (a
+    // restored transcript), so the status field, not the call shape, decides
+    // whether this wears the spawn layout.
+    let activity = !is_agent_tool(tool) && tool.subagent_status.is_none();
     let file_path = match &tool.call {
         ToolCall::ReadFile { path }
         | ToolCall::WriteFile { path, .. }
@@ -9611,10 +9614,9 @@ fn chip_header_row(
         .map(|(path, opener)| (path.to_owned(), opener.clone()));
     // The status is the CALL's, not the link's: a viewport that keeps the
     // child's report inline has no doc ref and still shows working/failed.
-    let running =
-        is_agent_tool(tool) && matches!(tool.subagent_status, Some(SubagentStatus::Running));
+    let running = matches!(tool.subagent_status, Some(SubagentStatus::Running));
     let failed = tool.is_error
-        || (is_agent_tool(tool) && matches!(tool.subagent_status, Some(SubagentStatus::Failed)));
+        || matches!(tool.subagent_status, Some(SubagentStatus::Failed));
     // Text resolves its color during layout, so group-hover text needs stable
     // child IDs under the keyed, expandable header to retain hover state.
     let hover_text = activity && trail.is_some() && !failed;
