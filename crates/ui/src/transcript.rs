@@ -2010,7 +2010,22 @@ pub fn top_gap_for(prev: Option<&Row>, row: &Row) -> f32 {
 /// Minimal splice for a row-set change: `Some((old_range, new_count))`, or
 /// `None` when the sets are identical by (id, version).
 pub fn diff_rows(old: &[Row], new: &[Row]) -> Option<(Range<usize>, usize)> {
-    let eq = |a: &Row, b: &Row| a.id == b.id && a.version == b.version;
+    diff_rows_by(old, new, |row| (row.id.as_ref(), row.version))
+}
+
+/// [`diff_rows`] over any row type: `key` reads the stable id and content
+/// version the splice compares. A viewport with its own row model uses this
+/// instead of copying the algorithm.
+pub fn diff_rows_by<T>(
+    old: &[T],
+    new: &[T],
+    key: impl for<'a> Fn(&'a T) -> (&'a str, u64),
+) -> Option<(Range<usize>, usize)> {
+    let eq = |a: &T, b: &T| {
+        let (a_id, a_version) = key(a);
+        let (b_id, b_version) = key(b);
+        a_id == b_id && a_version == b_version
+    };
     let mut prefix = 0usize;
     let max_prefix = old.len().min(new.len());
     while prefix < max_prefix && eq(&old[prefix], &new[prefix]) {
