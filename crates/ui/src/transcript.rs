@@ -39,7 +39,8 @@ use gpui::{
     TextRun, Window, canvas, div, img, list, point, prelude::*, px, size,
 };
 
-use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry, SubagentStatus};
+use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
+pub use zeron_doc::SubagentStatus;
 use zeron_proto::ToolCall;
 
 use crate::markdown::mermaid_cache::{self, MermaidCache};
@@ -8506,14 +8507,17 @@ impl Transcript {
                     return subagent_chip(
                         tool,
                         SharedString::from(format!("{row_id}#s{ix}")),
-                        cx.listener(move |_, _, _, cx| {
+                        SubagentChipAction::Open(Rc::new(cx.listener(move |_, _, _, cx| {
                             cx.emit(TranscriptEvent::OpenSubagent {
                                 chat_id: chat_id.clone(),
                                 doc_id: doc_id.to_string(),
                                 title: title.to_string(),
                                 frozen,
                             });
-                        }),
+                        }))),
+                        false,
+                        None,
+                        0.0,
                         collapses,
                         theme,
                         cx.entity_id(),
@@ -9605,11 +9609,12 @@ fn chip_header_row(
         .zip(file_opener)
         .filter(|(path, opener)| opener.opens(path))
         .map(|(path, opener)| (path.to_owned(), opener.clone()));
-    let running = tool.subagent_ref.is_some()
-        && matches!(tool.subagent_status, Some(SubagentStatus::Running));
+    // The status is the CALL's, not the link's: a viewport that keeps the
+    // child's report inline has no doc ref and still shows working/failed.
+    let running =
+        is_agent_tool(tool) && matches!(tool.subagent_status, Some(SubagentStatus::Running));
     let failed = tool.is_error
-        || (tool.subagent_ref.is_some()
-            && matches!(tool.subagent_status, Some(SubagentStatus::Failed)));
+        || (is_agent_tool(tool) && matches!(tool.subagent_status, Some(SubagentStatus::Failed)));
     // Text resolves its color during layout, so group-hover text needs stable
     // child IDs under the keyed, expandable header to retain hover state.
     let hover_text = activity && trail.is_some() && !failed;
@@ -9816,7 +9821,7 @@ fn chip_header_row(
             row.child(div().flex_none().child(crate::loaders::mini_glyph_spinner(
                 format!(
                     "subagent-chip-{}",
-                    tool.subagent_ref.as_deref().unwrap_or_default()
+                    tool.part_id.as_str()
                 ),
                 2.0,
                 theme.glyph,
@@ -10218,22 +10223,61 @@ pub fn tool_chip_accordion(
     reveal_tool_row(row, row_height, reveal)
 }
 
-/// A spawn chip: same card as [`tool_chip`], but the WHOLE card is the
-/// "open the subagent tab" click (open-arrow tile in the trailing slot).
-/// No accordion — an inline body would only repeat the subagent's own
-/// transcript. The group guide rail is omitted for agent-only rows (no
-/// collapse header for it to hang from).
-fn subagent_chip(
+/// What a spawn chip's click does. A viewport with child documents opens the
+/// child's transcript elsewhere; one without documents expands the chip's own
+/// body.
+pub enum SubagentChipAction {
+    /// Open the child's transcript in another surface.
+    Open(Rc<dyn Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App)>),
+    /// Expand the chip's own body.
+    Toggle(Rc<dyn Fn(&mut Window, &mut gpui::App)>),
+    /// No action.
+    None,
+}
+
+/// A spawn chip: same card as [`tool_chip`], with the whole card (or its
+/// header) as the action. `Open` carries the "opens elsewhere" arrow;
+/// `Toggle` carries the disclosure chevron and the caller's clipped `body` at
+/// `body_height`. The body stays at its natural height inside the clip, so a
+/// measure canvas can read it.
+#[allow(clippy::too_many_arguments)]
+pub fn subagent_chip(
     tool: &ToolItem,
     id: SharedString,
-    on_open: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+    action: SubagentChipAction,
+    open: bool,
+    body: Option<AnyElement>,
+    body_height: f32,
     rail: bool,
     theme: &Theme,
     view: gpui::EntityId,
     cx: &mut gpui::App,
 ) -> AnyElement {
+    let (trail, open_click, toggle_click) = match action {
+        SubagentChipAction::Open(open) => (Some(ChipTrail::OpenArrow), Some(open), None),
+        SubagentChipAction::Toggle(toggle) => {
+            (Some(ChipTrail::Chevron { open }), None, Some(toggle))
+        }
+        SubagentChipAction::None => (None, None, None),
+    };
+    let extra = if open { body_height.max(0.0) } else { 0.0 };
+    let header = chip_header_row(tool, trail, None, theme, view, cx);
+    let header = if let Some(toggle) = toggle_click {
+        div()
+            .id(SharedString::from(format!("{}-header", id.as_ref())))
+            .h(px(CHIP_HEADER_HEIGHT))
+            .flex_none()
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .on_click(move |_, window, cx| toggle(window, cx))
+            .child(header)
+            .into_any_element()
+    } else {
+        header.into_any_element()
+    };
     div()
-        .h(px(CHIP_HEIGHT))
+        .h(px(CHIP_HEIGHT + extra))
         .w_full()
         .flex_none()
         .flex()
@@ -10253,27 +10297,23 @@ fn subagent_chip(
             div()
                 .id(id)
                 .when(rail, |el| el.ml(px(12.0)))
-                .h(px(CHIP_CARD_HEIGHT))
+                .h(px(CHIP_CARD_HEIGHT + extra))
                 .min_w_0()
                 .flex_1()
                 .flex()
-                .items_center()
+                .flex_col()
                 .overflow_hidden()
                 .rounded(px(9.0))
                 .border_1()
                 .border_color(crate::theme::hairline(0.07))
                 .bg(crate::theme::ink(0.03))
-                .cursor_pointer()
-                .hover(|s| s.bg(crate::theme::ink(0.05)))
-                .on_click(on_open)
-                .child(chip_header_row(
-                    tool,
-                    Some(ChipTrail::OpenArrow),
-                    None,
-                    theme,
-                    view,
-                    cx,
-                )),
+                .when_some(open_click, |el, open| {
+                    el.cursor_pointer()
+                        .hover(|s| s.bg(crate::theme::ink(0.05)))
+                        .on_click(move |event, window, cx| open(event, window, cx))
+                })
+                .child(header)
+                .children(body),
         )
         .into_any_element()
 }
