@@ -921,6 +921,14 @@ pub fn apply_mac_app(staged: &Path, bundle: &Path) -> anyhow::Result<()> {
 /// single-instance engine lock and the IPC port. Paths travel as positional
 /// parameters, never spliced into the script. The caller quits after this.
 pub fn relaunch_after_exit(program: &Path, argument: &Path) {
+    if let Err(err) = try_relaunch_after_exit(program, argument) {
+        tracing::error!(error = %err, "failed to spawn the relauncher");
+    }
+}
+
+/// [`relaunch_after_exit`] with the spawn error returned instead of logged,
+/// for a host with its own logging.
+pub fn try_relaunch_after_exit(program: &Path, argument: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -939,12 +947,11 @@ if [ -n "$3" ]; then exec "$2" "$3"; else exec "$2"; fi"#;
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .process_group(0);
-        if let Err(err) = command.spawn() {
-            tracing::error!(error = %err, "failed to spawn the relauncher");
-        }
+        command.spawn()?;
     }
     #[cfg(not(unix))]
     let _ = (program, argument);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
