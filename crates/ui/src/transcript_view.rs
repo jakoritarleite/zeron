@@ -3735,6 +3735,18 @@ impl TranscriptMeta {
             rail_ticks: rail_ticks(&snapshot.entries, &snapshot.pending_echoes),
         }
     }
+
+    /// Meta for a host that supplies prebuilt rows: no prepared/baseline Arcs.
+    pub(crate) fn rows(revision: u64) -> Self {
+        Self {
+            selected_chat: None,
+            replay: TranscriptReplayState::Populated,
+            revision,
+            prepared: None,
+            baseline: None,
+            rail_ticks: Vec::new(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3753,23 +3765,27 @@ pub(crate) fn entry_snapshots() -> usize {
     ENTRY_SNAPSHOTS.with(Cell::get)
 }
 
-/// Borrowed row inputs for one sync. The prepared/baseline Arcs come from
+/// Row inputs for one sync. The prepared/baseline Arcs come from
 /// [`TranscriptMeta`], which the caller updates first.
-struct RowData<'a> {
-    entries: &'a [SessionMessageEntry],
-    pending_echoes: &'a [SessionMessageEntry],
+enum RowData<'a> {
+    Entries {
+        entries: &'a [SessionMessageEntry],
+        pending_echoes: &'a [SessionMessageEntry],
+    },
+    /// A host that already built its own rows.
+    Rows(Vec<Row>),
 }
 
 impl<'a> RowData<'a> {
     fn from_input(input: &'a TranscriptInput<'_>) -> Self {
-        Self {
+        Self::Entries {
             entries: input.entries,
             pending_echoes: input.pending_echoes,
         }
     }
 
     fn from_snapshot(snapshot: &'a TranscriptSnapshot) -> Self {
-        Self {
+        Self::Entries {
             entries: snapshot.entries.as_slice(),
             pending_echoes: snapshot.pending_echoes.as_slice(),
         }
@@ -3904,6 +3920,9 @@ pub struct TranscriptView {
     /// only then may the working trailer render — a frozen snapshot must
     /// never spin, whatever its entries claim.
     pub(crate) doc_live: bool,
+    /// The host owns its rows: rebuilds call [`TranscriptHost::rows`] instead
+    /// of materializing an entry snapshot.
+    pub(crate) rows_mode: bool,
     /// Memory-only viewport state for primary chats visited in this window.
     /// A transcript instance is shared across tabs, so the active ListState is
     /// reset on every attach and cannot retain these positions by itself.
@@ -4261,10 +4280,42 @@ impl TranscriptView {
         Self::build(state, Some(doc_id), follow, cx)
     }
 
+    /// Mount over an app-provided host. Unlike [`Self::new`], this never reads
+    /// `AppState`; the caller feeds prebuilt rows through [`Self::set_rows`].
+    pub(crate) fn with_host(
+        host: Rc<dyn TranscriptHost>,
+        doc_override: Option<String>,
+        follow: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::build_inner(host, doc_override, follow, true, cx)
+    }
+
     pub(crate) fn build(
         state: Entity<AppState>,
         doc_override: Option<String>,
         follow: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let host: Rc<dyn TranscriptHost> = Rc::new(AppStateHost::new(state.clone()));
+        // Seed from the borrowed state so the first frame is populated without
+        // retaining a full entry copy. Rows-mode hosts seed via `set_rows`.
+        let mut this = Self::build_inner(host, doc_override.clone(), follow, false, cx);
+        let plan = {
+            let state = state.read(cx);
+            this.plan_input(&TranscriptInput::new(&state, doc_override.as_deref()))
+        };
+        if let Some(plan) = plan {
+            this.apply_plan(plan, cx);
+        }
+        this
+    }
+
+    fn build_inner(
+        host: Rc<dyn TranscriptHost>,
+        doc_override: Option<String>,
+        follow: bool,
+        rows_mode: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         // FollowMode stays Normal: the tail pin is ours (a per-frame spring),
@@ -4286,7 +4337,6 @@ impl TranscriptView {
             ListAlignment::Bottom
         };
         let list = ListState::new(0, alignment, px(OVERDRAW_PX));
-        let host: Rc<dyn TranscriptHost> = Rc::new(AppStateHost::new(state.clone()));
         let weak = cx.weak_entity();
         list.set_scroll_handler(move |event: &ListScrollEvent, _window, cx| {
             weak.update(cx, |this: &mut TranscriptView, cx| {
@@ -4322,6 +4372,7 @@ impl TranscriptView {
             retain_on_deselect: false,
             land_end_pending: doc_override.is_some() && !follow,
             doc_live: doc_override.is_some() && follow,
+            rows_mode,
             doc_override: doc_override.clone(),
             saved_viewports: SavedViewportCache::default(),
             pending_viewport: None,
@@ -4405,15 +4456,6 @@ impl TranscriptView {
             blob_fetch_order: HashMap::new(),
             blob_fetch_counter: 0,
         };
-        // Seed from the borrowed state so the first frame is populated without
-        // retaining a full entry copy.
-        let plan = {
-            let state = state.read(cx);
-            this.plan_input(&TranscriptInput::new(&state, doc_override.as_deref()))
-        };
-        if let Some(plan) = plan {
-            this.apply_plan(plan, cx);
-        }
         this
     }
 
@@ -4564,6 +4606,25 @@ impl TranscriptView {
             self.saved_viewports
                 .insert(chat_id, SavedViewport::FollowTail);
         }
+    }
+
+    /// Feed a host-built row set through the normal plan/splice path without
+    /// reading entries or `AppState`.
+    pub(crate) fn set_rows(
+        &mut self,
+        rows: Vec<Row>,
+        mut meta: TranscriptMeta,
+        cx: &mut Context<Self>,
+    ) {
+        self.rows_mode = true;
+        // An unspecified chat follows the doc this instance is pinned to.
+        if meta.selected_chat.is_none() {
+            meta.selected_chat = self.doc_override.clone();
+        }
+        self.last_source = Some((meta.selected_chat.clone(), meta.replay, meta.revision));
+        self.meta = meta;
+        let plan = self.plan_source(RowData::Rows(rows));
+        self.apply_plan(plan, cx);
     }
 
     /// Build rows from one borrowed revision. Ignores a revision the view has
@@ -5432,6 +5493,19 @@ impl TranscriptView {
             self.veil_attach_pending = true;
             return;
         }
+        if self.rows_mode {
+            let Some(rows) = self.host.rows(cx) else {
+                return;
+            };
+            self.last_source = Some((
+                self.meta.selected_chat.clone(),
+                self.meta.replay,
+                self.meta.revision,
+            ));
+            let plan = self.plan_source(RowData::Rows(rows));
+            self.apply_plan(plan, cx);
+            return;
+        }
         let Some(snapshot) = self.host.snapshot(self.doc_override.as_deref(), cx) else {
             return;
         };
@@ -5460,10 +5534,18 @@ impl TranscriptView {
         let replay = self.meta.replay;
         let prepared = self.meta.prepared.clone();
         let baseline = self.meta.baseline.clone();
-        let RowData {
-            entries,
-            pending_echoes: echoes,
-        } = data;
+        let (entries, echoes, prebuilt): (
+            &[SessionMessageEntry],
+            &[SessionMessageEntry],
+            Option<Vec<Row>>,
+        ) = match data {
+            RowData::Entries {
+                entries,
+                pending_echoes,
+            } => (entries, pending_echoes, None),
+            RowData::Rows(rows) => (&[], &[], Some(rows)),
+        };
+        let rows_mode = prebuilt.is_some();
 
         let attached = selected != self.chat_id;
         // Arm the replay baseline before classifying tool arrivals. Selection
@@ -5552,10 +5634,19 @@ impl TranscriptView {
             self.stop_selection_scroll();
         }
 
-        let mut new_rows: Vec<Row> = Vec::new();
+        let mut new_rows: Vec<Row> = prebuilt.unwrap_or_default();
         // `rows_for` mutates our caches, so the borrowed entries are read
         // straight from the input; nothing is copied per revision.
-        let (entries_empty, tail_streaming) = {
+        let (entries_empty, tail_streaming) = if rows_mode {
+            (
+                new_rows.is_empty(),
+                new_rows.last().is_some_and(|row| {
+                    matches!(row.kind, RowKind::LiveMarkdown { .. })
+                        || (row.timestamp.is_none()
+                            && !matches!(row.kind, RowKind::ForkMarker { .. }))
+                }),
+            )
+        } else {
             for entry in entries.iter() {
                 if !self.compact_mode
                     && let Some(rows) = prepared.as_ref().and_then(|p| p.rows.get(&entry.id))

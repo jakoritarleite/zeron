@@ -62,6 +62,202 @@ mod tests {
         }
     }
 
+    struct FakeRowsHost {
+        rows: RefCell<Vec<Row>>,
+        rows_calls: Cell<usize>,
+    }
+
+    impl FakeRowsHost {
+        fn new(rows: Vec<Row>) -> Self {
+            Self {
+                rows: RefCell::new(rows),
+                rows_calls: Cell::new(0),
+            }
+        }
+
+        fn replace(&self, rows: Vec<Row>) {
+            *self.rows.borrow_mut() = rows;
+        }
+    }
+
+    impl TranscriptHost for FakeRowsHost {
+        fn link_roots_revision(&self, _: &App) -> u64 {
+            0
+        }
+        fn file_link_roots(&self, _: &str, _: &App) -> Vec<crate::workspace_links::FileLinkRoot> {
+            Vec::new()
+        }
+        fn chat_is_local(&self, _: &str, _: &App) -> bool {
+            false
+        }
+        fn workspace_root(&self, _: Option<&str>, _: &App) -> Option<SharedString> {
+            None
+        }
+        fn image_host(&self, _: Option<&str>, _: &App) -> (Option<String>, Option<String>) {
+            (None, None)
+        }
+        fn attachment_device_ids(&self, _: &App) -> Vec<String> {
+            Vec::new()
+        }
+        fn local_device_id(&self, _: &App) -> Option<String> {
+            None
+        }
+        fn engine_available(&self, _: &App) -> bool {
+            false
+        }
+        fn upload_progress_percent(&self, _: &App) -> Option<u8> {
+            None
+        }
+        fn transfer_percent(&self, _: &str, _: &App) -> Option<u8> {
+            None
+        }
+        fn send_undelivered(&self, _: &str, _: chrono::DateTime<chrono::Utc>, _: &App) -> bool {
+            false
+        }
+        fn pending_send_started(
+            &self,
+            _: &str,
+            _: chrono::DateTime<chrono::Utc>,
+            _: &App,
+        ) -> Option<chrono::DateTime<chrono::Utc>> {
+            None
+        }
+        fn chat_delivery_degraded(&self, _: &str, _: &App) -> bool {
+            false
+        }
+        fn session_started_at(&self, _: &str, _: &App) -> Option<chrono::DateTime<chrono::Utc>> {
+            None
+        }
+        fn indicator_for(
+            &self,
+            _: &str,
+            _: chrono::DateTime<chrono::Utc>,
+            _: &App,
+        ) -> crate::state::Indicator {
+            crate::state::Indicator::None
+        }
+        fn doc_trailer(&self, _: &str, _: &App) -> Option<crate::transcript_host::DocTrailer> {
+            None
+        }
+        fn last_assistant_id(&self, _: &App) -> Option<String> {
+            None
+        }
+        fn rows(&self, _: &App) -> Option<Vec<Row>> {
+            self.rows_calls.set(self.rows_calls.get() + 1);
+            Some(self.rows.borrow().clone())
+        }
+        fn retry_send(&self, _: &str, _: chrono::DateTime<chrono::Utc>, _: &mut App) {}
+        fn fetch_tool_blob(&self, _: SharedString, _: &gpui::AsyncApp) -> Task<Option<String>> {
+            Task::ready(None)
+        }
+        fn read_attachment_image(
+            &self,
+            _: String,
+            _: String,
+            _: Option<String>,
+            _: &gpui::AsyncApp,
+        ) -> Task<Option<crate::attachments::LoadedAttachmentImage>> {
+            Task::ready(None)
+        }
+        fn read_attachment_bytes(
+            &self,
+            _: &str,
+            _: &str,
+            _: &gpui::AsyncApp,
+        ) -> Task<Option<(String, String, Vec<u8>)>> {
+            Task::ready(None)
+        }
+        fn tool_image_loader(&self, _: &App) -> crate::tool_images::Loader {
+            crate::tool_images::Loader {
+                engine: None,
+                local_device: None,
+            }
+        }
+        fn visual_frame(
+            &self,
+            _: SharedString,
+            _: String,
+            _: String,
+            _: &str,
+            _: &mut App,
+        ) -> Entity<crate::visuals::VisualFrame> {
+            unimplemented!("rows fixture has no visuals")
+        }
+    }
+
+    struct RowsFixture(Entity<TranscriptView>);
+
+    impl Render for RowsFixture {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.0.clone().into_any_element()
+        }
+    }
+
+    fn init_rows_test(cx: &mut gpui::TestAppContext) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+        });
+        dir
+    }
+
+    #[gpui::test]
+    fn rows_host_splices_and_renders_without_app_state(cx: &mut gpui::TestAppContext) {
+        let _dir = init_rows_test(cx);
+        // No AppState is constructed anywhere on this path.
+        let host = Rc::new(FakeRowsHost::new(Vec::new()));
+        let dyn_host: Rc<dyn TranscriptHost> = host.clone();
+        let view = cx.new(|cx| TranscriptView::with_host(dyn_host, None, true, cx));
+        view.update(cx, |this, cx| {
+            this.set_rows(
+                vec![viewport_row("r0", "e0"), viewport_row("r1", "e1")],
+                TranscriptMeta::rows(1),
+                cx,
+            );
+        });
+        assert_eq!(view.read_with(cx, |this, _| this.rows.len()), 2);
+
+        let (fixture, cx) = cx.add_window_view(|_, _| RowsFixture(view.clone()));
+        fixture.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert!(
+            view.read_with(cx, |this, _| this
+                .rendered_rows
+                .contains(&SharedString::from("r0"))),
+            "the spliced row must render"
+        );
+    }
+
+    #[gpui::test]
+    fn rows_mode_fold_rebuild_refetches_host_rows(cx: &mut gpui::TestAppContext) {
+        let _dir = init_rows_test(cx);
+        let host = Rc::new(FakeRowsHost::new(vec![viewport_row("old", "e-old")]));
+        let dyn_host: Rc<dyn TranscriptHost> = host.clone();
+        let view = cx.new(|cx| TranscriptView::with_host(dyn_host, None, true, cx));
+        view.update(cx, |this, cx| {
+            this.set_rows(
+                vec![viewport_row("old", "e-old")],
+                TranscriptMeta::rows(1),
+                cx,
+            );
+        });
+        assert_eq!(host.rows_calls.get(), 0, "set_rows uses the given rows");
+
+        // Fold/compact rebuilds reset the source and resync from the host.
+        host.replace(vec![viewport_row("new", "e-new")]);
+        view.update(cx, |this, cx| {
+            this.last_source = None;
+            this.sync(cx);
+        });
+        assert_eq!(host.rows_calls.get(), 1);
+        view.read_with(cx, |this, _| {
+            assert_eq!(this.rows.len(), 1);
+            assert_eq!(this.rows[0].id.as_ref(), "new");
+        });
+    }
+
     #[test]
     fn jump_button_stays_available_when_scrolling_down_until_near_bottom() {
         let mut shown = false;

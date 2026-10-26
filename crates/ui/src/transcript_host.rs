@@ -5,6 +5,7 @@
 //! Phase 1 keeps that behind an object-safe host so the surface can later run
 //! without `AppState`; [`AppStateHost`] is the current, only implementation.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -13,7 +14,7 @@ use gpui::{App, AppContext as _, AsyncApp, Entity, SharedString, Task};
 use crate::attachments::LoadedAttachmentImage;
 use crate::state::{AppState, Indicator};
 use crate::tool_images::Loader;
-use crate::transcript_view::{TranscriptInput, TranscriptSnapshot};
+use crate::transcript_view::{Row, TranscriptInput, TranscriptSnapshot, rows_for_entry};
 use crate::visuals::VisualFrame;
 use crate::workspace_links::FileLinkRoot;
 
@@ -53,6 +54,11 @@ pub(crate) trait TranscriptHost {
     /// Materialize the full entry snapshot on demand — compact-mode flips,
     /// fold rebuilds and route exit. Never a normal streaming revision.
     fn snapshot(&self, _doc_override: Option<&str>, _cx: &App) -> Option<TranscriptSnapshot> {
+        None
+    }
+    /// Rebuild the rows from the host's own model. Rows-mode fold, compact and
+    /// route-exit refreshes call this instead of `snapshot`.
+    fn rows(&self, _cx: &App) -> Option<Vec<Row>> {
         None
     }
     /// Re-kick every delivery road and restart the failed-send grace clock.
@@ -229,6 +235,27 @@ impl TranscriptHost for AppStateHost {
 
     fn snapshot(&self, doc_override: Option<&str>, cx: &App) -> Option<TranscriptSnapshot> {
         Some(TranscriptInput::new(&self.state.read(cx), doc_override).into_snapshot())
+    }
+
+    /// The selected chat's rows, reusing background preparation when it is
+    /// current and parsing misses on demand.
+    fn rows(&self, cx: &App) -> Option<Vec<Row>> {
+        let state = self.state.read(cx);
+        let input = TranscriptInput::new(&state, None);
+        let compact = crate::settings::transcript_compact_mode(cx);
+        let mut parse = |_: &str, text: &str| Arc::new(crate::markdown::parser::parse_full(text));
+        let mut rows = Vec::new();
+        for entry in input.entries {
+            if !compact && let Some(prepared) = input.prepared.and_then(|p| p.rows.get(&entry.id)) {
+                rows.extend(prepared.iter().cloned());
+            } else {
+                rows.extend(rows_for_entry(entry, false, compact, &mut parse));
+            }
+        }
+        for echo in input.pending_echoes {
+            rows.extend(rows_for_entry(echo, true, compact, &mut parse));
+        }
+        Some(rows)
     }
 
     fn retry_send(&self, chat_id: &str, now: DateTime<Utc>, cx: &mut App) {
