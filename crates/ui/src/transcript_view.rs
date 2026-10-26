@@ -51,6 +51,7 @@ use crate::markdown::render::{self, RenderCache, RenderOptions};
 use crate::markdown::veil::RowVeil;
 use crate::motion::{self, AnimationExt as _};
 use crate::notice::{NoticeChipIcon::Tile, notice_chip};
+use crate::rail::{RailTick, rail_ticks};
 use crate::state::AppState;
 use crate::syntax_cache::{DocumentHighlightKey, SyntaxHighlightCache};
 use crate::theme::Theme;
@@ -3365,9 +3366,9 @@ impl TranscriptReplayState {
     }
 }
 
-/// One state-derived snapshot handed to [`TranscriptView`] by the shell-facing
-/// `Transcript` handle. Borrowed so the wrapper never owns a second copy of
-/// the view's data for longer than the push.
+/// One state-derived revision handed to [`TranscriptView`] by the shell-facing
+/// `Transcript` handle. Borrowed so a normal sync builds rows straight from
+/// `AppState` without cloning entries.
 pub(crate) struct TranscriptInput<'a> {
     pub(crate) selected_chat: Option<&'a str>,
     pub(crate) replay: TranscriptReplayState,
@@ -3410,7 +3411,11 @@ impl<'a> TranscriptInput<'a> {
         }
     }
 
-    fn into_snapshot(self) -> TranscriptSnapshot {
+    /// Materialize the full entry snapshot. On-demand only — compact flips,
+    /// fold rebuilds and route exit — never a normal revision sync.
+    pub(crate) fn into_snapshot(self) -> TranscriptSnapshot {
+        #[cfg(test)]
+        ENTRY_SNAPSHOTS.with(|count| count.set(count.get() + 1));
         TranscriptSnapshot {
             selected_chat: self.selected_chat.map(ToOwned::to_owned),
             replay: self.replay,
@@ -3423,8 +3428,8 @@ impl<'a> TranscriptInput<'a> {
     }
 }
 
-/// Owned form kept by the view: a fold toggle or compact-mode switch rebuilds
-/// rows from this snapshot instead of reaching back into `AppState`.
+/// Owned entries, materialized on demand (compact flips, fold rebuilds, route
+/// exit) and dropped at the end of that sync.
 pub(crate) struct TranscriptSnapshot {
     pub(crate) selected_chat: Option<String>,
     pub(crate) replay: TranscriptReplayState,
@@ -3433,6 +3438,101 @@ pub(crate) struct TranscriptSnapshot {
     pub(crate) pending_echoes: Rc<Vec<SessionMessageEntry>>,
     pub(crate) prepared: Option<Arc<PreparedTranscript>>,
     pub(crate) baseline: Option<Arc<zeron_doc::TranscriptBaseline>>,
+}
+
+/// The small slice of app state the view keeps between revisions: identity,
+/// the prepared/baseline Arcs, and one rail tick per user prompt. Never the
+/// full entry list.
+pub(crate) struct TranscriptMeta {
+    pub(crate) selected_chat: Option<String>,
+    pub(crate) replay: TranscriptReplayState,
+    pub(crate) revision: u64,
+    pub(crate) prepared: Option<Arc<PreparedTranscript>>,
+    pub(crate) baseline: Option<Arc<zeron_doc::TranscriptBaseline>>,
+    pub(crate) rail_ticks: Vec<RailTick>,
+}
+
+impl TranscriptMeta {
+    fn empty() -> Self {
+        Self {
+            selected_chat: None,
+            replay: TranscriptReplayState::Pending,
+            revision: 0,
+            prepared: None,
+            baseline: None,
+            rail_ticks: Vec::new(),
+        }
+    }
+
+    fn from_input(input: &TranscriptInput<'_>) -> Self {
+        Self {
+            selected_chat: input.selected_chat.map(ToOwned::to_owned),
+            replay: input.replay,
+            revision: input.revision,
+            prepared: input.prepared.cloned(),
+            baseline: input.baseline.cloned(),
+            rail_ticks: rail_ticks(input.entries, input.pending_echoes),
+        }
+    }
+
+    fn from_snapshot(snapshot: &TranscriptSnapshot) -> Self {
+        Self {
+            selected_chat: snapshot.selected_chat.clone(),
+            replay: snapshot.replay,
+            revision: snapshot.revision,
+            prepared: snapshot.prepared.clone(),
+            baseline: snapshot.baseline.clone(),
+            rail_ticks: rail_ticks(&snapshot.entries, &snapshot.pending_echoes),
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Counts full entry snapshots materialized on this test thread.
+    static ENTRY_SNAPSHOTS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_entry_snapshots() {
+    ENTRY_SNAPSHOTS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn entry_snapshots() -> usize {
+    ENTRY_SNAPSHOTS.with(Cell::get)
+}
+
+/// Borrowed row inputs for one sync. The prepared/baseline Arcs come from
+/// [`TranscriptMeta`], which the caller updates first.
+struct RowData<'a> {
+    entries: &'a [SessionMessageEntry],
+    pending_echoes: &'a [SessionMessageEntry],
+}
+
+impl<'a> RowData<'a> {
+    fn from_input(input: &'a TranscriptInput<'_>) -> Self {
+        Self {
+            entries: input.entries,
+            pending_echoes: input.pending_echoes,
+        }
+    }
+
+    fn from_snapshot(snapshot: &'a TranscriptSnapshot) -> Self {
+        Self {
+            entries: snapshot.entries.as_slice(),
+            pending_echoes: snapshot.pending_echoes.as_slice(),
+        }
+    }
+}
+
+/// Rows built by a sync, applied once the borrowed input is released.
+pub(crate) struct SyncPlan {
+    rows: Vec<Row>,
+    attached: bool,
+    replay: TranscriptReplayState,
+    baseline_changed: bool,
+    tail_streaming: bool,
 }
 
 impl ViewportFinalizeToken {
@@ -3533,9 +3633,9 @@ impl SavedViewportCache {
 }
 
 pub struct TranscriptView {
-    /// The last snapshot pushed by the shell-facing handle; built from
-    /// `AppState` there, never read directly by the view.
-    pub(crate) input: TranscriptSnapshot,
+    /// The small metadata pushed by the shell-facing handle; rows are built
+    /// from a borrowed input during sync, never from a retained entry copy.
+    pub(crate) meta: TranscriptMeta,
     pub(crate) host: Rc<dyn TranscriptHost>,
     pub(crate) list: ListState,
     pub(crate) rows: Vec<Row>,
@@ -3936,9 +4036,6 @@ impl TranscriptView {
             ListAlignment::Bottom
         };
         let list = ListState::new(0, alignment, px(OVERDRAW_PX));
-        // Seed from the current app state so the first frame is populated;
-        // the shell-facing handle refreshes this snapshot afterwards.
-        let input = TranscriptInput::new(&state.read(cx), doc_override.as_deref()).into_snapshot();
         let host: Rc<dyn TranscriptHost> = Rc::new(AppStateHost::new(state.clone()));
         let weak = cx.weak_entity();
         list.set_scroll_handler(move |event: &ListScrollEvent, _window, cx| {
@@ -3964,7 +4061,7 @@ impl TranscriptView {
         // wheel-up, and resticks/jumps exactly like the main transcript.
         let pinned = follow;
         let mut this = Self {
-            input,
+            meta: TranscriptMeta::empty(),
             host,
             list,
             rows: Vec::new(),
@@ -3975,7 +4072,7 @@ impl TranscriptView {
             retain_on_deselect: false,
             land_end_pending: doc_override.is_some() && !follow,
             doc_live: doc_override.is_some() && follow,
-            doc_override,
+            doc_override: doc_override.clone(),
             saved_viewports: SavedViewportCache::default(),
             pending_viewport: None,
             viewport_generation: 0,
@@ -4058,7 +4155,15 @@ impl TranscriptView {
             blob_fetch_order: HashMap::new(),
             blob_fetch_counter: 0,
         };
-        this.sync(cx);
+        // Seed from the borrowed state so the first frame is populated without
+        // retaining a full entry copy.
+        let plan = {
+            let state = state.read(cx);
+            this.plan_input(&TranscriptInput::new(&state, doc_override.as_deref()))
+        };
+        if let Some(plan) = plan {
+            this.apply_plan(plan, cx);
+        }
         this
     }
 
@@ -4211,19 +4316,28 @@ impl TranscriptView {
         }
     }
 
-    /// Push the snapshot the shell-facing handle derived from `AppState`.
-    /// Ignores a snapshot the view has already synced; a resync is a no-op
-    /// unless the source (selection, replay readiness, revision) moved.
-    pub(crate) fn set_input(&mut self, input: TranscriptInput<'_>) {
+    /// Build rows from one borrowed revision. Ignores a revision the view has
+    /// already synced; a resync is a no-op unless the source (selection, replay
+    /// readiness, revision) moved. App-only finishing happens in
+    /// [`Self::apply_plan`] after the borrowed input is released.
+    pub(crate) fn plan_input(&mut self, input: &TranscriptInput<'_>) -> Option<SyncPlan> {
         let source = (
             input.selected_chat.map(ToOwned::to_owned),
             input.replay,
             input.revision,
         );
-        if self.last_source.as_ref() == Some(&source) {
-            return;
+        if self.last_source.as_ref() != Some(&source) {
+            self.meta = TranscriptMeta::from_input(input);
         }
-        self.input = input.into_snapshot();
+        if self.route_exit_pending() {
+            self.veil_attach_pending = true;
+            return None;
+        }
+        if self.last_source.as_ref() == Some(&source) {
+            return None;
+        }
+        self.last_source = Some(source);
+        Some(self.plan_source(RowData::from_input(input)))
     }
 
     /// Hand viewport ownership to explicit rail/navigation input before its
@@ -5046,42 +5160,60 @@ impl TranscriptView {
     pub(crate) fn route_exit_pending(&self) -> bool {
         self.retain_on_deselect
             && self.doc_override.is_none()
-            && self.input.selected_chat.is_none()
+            && self.meta.selected_chat.is_none()
             && self.chat_id.is_some()
     }
 
     pub(crate) fn finish_route_exit(&mut self, cx: &mut Context<Self>) {
-        if self.input.selected_chat.is_none() && self.chat_id.is_some() {
+        if self.meta.selected_chat.is_none() && self.chat_id.is_some() {
             self.retain_on_deselect = false;
             self.sync(cx);
             self.retain_on_deselect = true;
         }
     }
 
-    /// Rebuild rows from the last pushed snapshot; splice minimal ranges into
-    /// the list.
+    /// Rebuild rows from a freshly fetched snapshot. Only compact-mode flips,
+    /// fold rebuilds and route exit pay for the full copy; a streaming
+    /// revision arrives through [`Self::plan_input`] instead.
     pub(crate) fn sync(&mut self, cx: &mut Context<Self>) {
-        if self.retain_on_deselect
-            && self.doc_override.is_none()
-            && self.input.selected_chat.is_none()
-            && self.chat_id.is_some()
-        {
+        if self.route_exit_pending() {
             // A quick return can reuse this entity before the exit finishes.
             // Its next snapshot is still a replay, not newly arriving tools.
             self.veil_attach_pending = true;
             return;
         }
-        // `selected` equals `chat_id` for a pinned subagent doc by
-        // construction, so the attach/reset branch below never fires, and
-        // echoes stay empty (nothing is ever sent from there).
-        let selected = self.input.selected_chat.clone();
-        let replay = self.input.replay;
-
-        let source = (selected.clone(), replay, self.input.revision);
+        let Some(snapshot) = self.host.snapshot(self.doc_override.as_deref(), cx) else {
+            return;
+        };
+        self.meta = TranscriptMeta::from_snapshot(&snapshot);
+        let source = (
+            self.meta.selected_chat.clone(),
+            self.meta.replay,
+            self.meta.revision,
+        );
         if self.last_source.as_ref() == Some(&source) {
             return;
         }
         self.last_source = Some(source);
+        let plan = self.plan_source(RowData::from_snapshot(&snapshot));
+        drop(snapshot);
+        self.apply_plan(plan, cx);
+    }
+
+    /// Build rows from the borrowed source without touching `Context`; the
+    /// caller applies the plan once the `AppState` borrow is released.
+    fn plan_source(&mut self, data: RowData<'_>) -> SyncPlan {
+        // `selected` equals `chat_id` for a pinned subagent doc by
+        // construction, so the attach/reset branch below never fires, and
+        // echoes stay empty (nothing is ever sent from there).
+        let selected = self.meta.selected_chat.clone();
+        let replay = self.meta.replay;
+        let prepared = self.meta.prepared.clone();
+        let baseline = self.meta.baseline.clone();
+        let RowData {
+            entries,
+            pending_echoes: echoes,
+        } = data;
 
         let attached = selected != self.chat_id;
         // Arm the replay baseline before classifying tool arrivals. Selection
@@ -5110,7 +5242,6 @@ impl TranscriptView {
             }
             self.chat_id = selected;
             self.rows.clear();
-            self.tool_images.clear(cx);
             self.row_cache.clear();
             self.live_parsers.clear();
             self.tree_cache.clear();
@@ -5172,11 +5303,8 @@ impl TranscriptView {
         }
 
         let mut new_rows: Vec<Row> = Vec::new();
-        // Rc-clone the snapshot slices so `rows_for` can mutate our caches
-        // without copying every text and tool payload on each notification.
-        let entries = self.input.entries.clone();
-        let echoes = self.input.pending_echoes.clone();
-        let prepared = self.input.prepared.clone();
+        // `rows_for` mutates our caches, so the borrowed entries are read
+        // straight from the input; nothing is copied per revision.
         let (entries_empty, tail_streaming) = {
             for entry in entries.iter() {
                 if !self.compact_mode
@@ -5200,7 +5328,6 @@ impl TranscriptView {
             )
         };
 
-        let baseline = self.input.baseline.clone();
         let baseline_changed = baseline.as_ref().is_some_and(|baseline| {
             self.last_replay_baseline
                 .as_ref()
@@ -5440,6 +5567,28 @@ impl TranscriptView {
         self.veil_baseline.retain(|id| active_markdown.contains(id));
         self.historical_markdown
             .retain(|id, _| active_markdown.contains(id));
+
+        SyncPlan {
+            rows: new_rows,
+            attached,
+            replay,
+            baseline_changed,
+            tail_streaming,
+        }
+    }
+
+    /// Splice the built rows into the list and run app-only finishing.
+    pub(crate) fn apply_plan(&mut self, plan: SyncPlan, cx: &mut Context<Self>) {
+        let SyncPlan {
+            rows: new_rows,
+            attached,
+            replay,
+            baseline_changed,
+            tail_streaming,
+        } = plan;
+        if attached {
+            self.tool_images.clear(cx);
+        }
 
         // Capture this before the row splice changes the list's measured end.
         // When the user is truly live-following, retaining the end anchor

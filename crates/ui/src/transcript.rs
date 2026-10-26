@@ -44,8 +44,8 @@ mod tests {
     use crate::transcript_host::{AppStateHost, TranscriptHost};
     use zeron_syntax::LanguageId as Lang;
 
-    /// Push a fresh snapshot from the fixture's app state before syncing: the
-    /// view no longer reads `AppState` itself.
+    /// Push a fresh revision from the fixture's app state before applying it:
+    /// the view no longer reads `AppState` itself.
     fn test_sync(view: &mut TranscriptView, cx: &mut Context<TranscriptView>) {
         let state = view
             .host
@@ -53,11 +53,13 @@ mod tests {
             .expect("test view is backed by AppState")
             .clone();
         let doc_override = view.doc_override.clone();
-        {
+        let plan = {
             let state = state.read(cx);
-            view.set_input(TranscriptInput::new(&state, doc_override.as_deref()));
+            view.plan_input(&TranscriptInput::new(&state, doc_override.as_deref()))
+        };
+        if let Some(plan) = plan {
+            view.apply_plan(plan, cx);
         }
-        view.sync(cx);
     }
 
     #[test]
@@ -97,6 +99,65 @@ mod tests {
             });
         });
     }
+
+    #[gpui::test]
+    fn text_revision_keeps_no_entry_snapshot(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+        });
+        let state = cx.new(|_| AppState::new());
+        let transcript = cx.new(|cx| TranscriptView::new(state.clone(), cx));
+        let mut prompt = assistant(
+            "u1",
+            MessageStatus::Complete,
+            vec![text_part("t0", "hello")],
+        );
+        prompt.role = MessageRole::User;
+        state.update(cx, |state, _| {
+            state.selected_chat = Some("chat".into());
+            state.transcript_replayed = true;
+            state.transcript = vec![
+                prompt,
+                assistant("a1", MessageStatus::Streaming, vec![text_part("t1", "hi")]),
+            ];
+            state.transcript_revision += 1;
+        });
+        crate::transcript_view::reset_entry_snapshots();
+        transcript.update(cx, |this, cx| test_sync(this, cx));
+        assert_eq!(
+            crate::transcript_view::entry_snapshots(),
+            0,
+            "a streaming revision must build rows from the borrowed input"
+        );
+        assert_eq!(
+            transcript.update(cx, |this, _| this.meta.rail_ticks.len()),
+            1
+        );
+        state.update(cx, |state, _| {
+            state.transcript[1].parts = vec![text_part("t1", "hi there")];
+            state.transcript_revision += 1;
+        });
+        transcript.update(cx, |this, cx| test_sync(this, cx));
+        assert_eq!(
+            crate::transcript_view::entry_snapshots(),
+            0,
+            "a text-only revision must not retain a full entry snapshot"
+        );
+        // Contrast: a forced rebuild (fold/compact path) fetches one on demand.
+        transcript.update(cx, |this, cx| {
+            this.last_source = None;
+            this.sync(cx);
+        });
+        assert_eq!(
+            crate::transcript_view::entry_snapshots(),
+            1,
+            "fold rebuilds materialize a snapshot only when they need one"
+        );
+    }
+
     use zeron_doc::MessagePart;
 
     fn with_tool_group_navigation(
@@ -5888,18 +5949,18 @@ impl Transcript {
         this
     }
 
-    /// Build a snapshot outside `AppState`'s borrow, then let the view derive
-    /// rows: reading the entity and updating the view both need `cx`.
+    /// Build rows from the borrowed state, then apply them after the borrow
+    /// ends: reading the entity and mutating the view both need `cx`.
     fn sync(&mut self, cx: &mut Context<Self>) {
         let doc_override = self.view.read(cx).doc_override.clone();
         let state = self.state.clone();
-        self.view.update(cx, |view, cx| {
-            {
-                let state = state.read(cx);
-                view.set_input(TranscriptInput::new(&state, doc_override.as_deref()));
-            }
-            view.sync(cx);
+        let plan = self.view.update(cx, |view, cx| {
+            let state = state.read(cx);
+            view.plan_input(&TranscriptInput::new(&state, doc_override.as_deref()))
         });
+        if let Some(plan) = plan {
+            self.view.update(cx, |view, cx| view.apply_plan(plan, cx));
+        }
     }
 
     pub(crate) fn set_workspace_link_handler(

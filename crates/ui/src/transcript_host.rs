@@ -13,6 +13,7 @@ use gpui::{App, AppContext as _, AsyncApp, Entity, SharedString, Task};
 use crate::attachments::LoadedAttachmentImage;
 use crate::state::{AppState, Indicator};
 use crate::tool_images::Loader;
+use crate::transcript_view::{TranscriptInput, TranscriptSnapshot};
 use crate::visuals::VisualFrame;
 use crate::workspace_links::FileLinkRoot;
 
@@ -49,6 +50,11 @@ pub(crate) trait TranscriptHost {
     /// The trailing subagent-doc entry, if any.
     fn doc_trailer(&self, doc_id: &str, cx: &App) -> Option<DocTrailer>;
     fn last_assistant_id(&self, cx: &App) -> Option<String>;
+    /// Materialize the full entry snapshot on demand — compact-mode flips,
+    /// fold rebuilds and route exit. Never a normal streaming revision.
+    fn snapshot(&self, _doc_override: Option<&str>, _cx: &App) -> Option<TranscriptSnapshot> {
+        None
+    }
     /// Re-kick every delivery road and restart the failed-send grace clock.
     fn retry_send(&self, chat_id: &str, now: DateTime<Utc>, cx: &mut App);
 
@@ -219,6 +225,10 @@ impl TranscriptHost for AppStateHost {
             .rev()
             .find(|entry| entry.role == zeron_doc::MessageRole::Assistant)
             .map(|entry| entry.id.clone())
+    }
+
+    fn snapshot(&self, doc_override: Option<&str>, cx: &App) -> Option<TranscriptSnapshot> {
+        Some(TranscriptInput::new(&self.state.read(cx), doc_override).into_snapshot())
     }
 
     fn retry_send(&self, chat_id: &str, now: DateTime<Utc>, cx: &mut App) {
