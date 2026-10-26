@@ -3680,7 +3680,7 @@ impl<'a> TranscriptInput<'a> {
 
 /// Owned entries, materialized on demand (compact flips, fold rebuilds, route
 /// exit) and dropped at the end of that sync.
-pub(crate) struct TranscriptSnapshot {
+pub struct TranscriptSnapshot {
     pub(crate) selected_chat: Option<String>,
     pub(crate) replay: TranscriptReplayState,
     pub(crate) revision: u64,
@@ -3693,7 +3693,7 @@ pub(crate) struct TranscriptSnapshot {
 /// The small slice of app state the view keeps between revisions: identity,
 /// the prepared/baseline Arcs, and one rail tick per user prompt. Never the
 /// full entry list.
-pub(crate) struct TranscriptMeta {
+pub struct TranscriptMeta {
     pub(crate) selected_chat: Option<String>,
     pub(crate) replay: TranscriptReplayState,
     pub(crate) revision: u64,
@@ -3737,7 +3737,7 @@ impl TranscriptMeta {
     }
 
     /// Meta for a host that supplies prebuilt rows: no prepared/baseline Arcs.
-    pub(crate) fn rows(revision: u64) -> Self {
+    pub fn rows(revision: u64) -> Self {
         Self {
             selected_chat: None,
             replay: TranscriptReplayState::Populated,
@@ -4282,7 +4282,7 @@ impl TranscriptView {
 
     /// Mount over an app-provided host. Unlike [`Self::new`], this never reads
     /// `AppState`; the caller feeds prebuilt rows through [`Self::set_rows`].
-    pub(crate) fn with_host(
+    pub fn with_host(
         host: Rc<dyn TranscriptHost>,
         doc_override: Option<String>,
         follow: bool,
@@ -4610,7 +4610,7 @@ impl TranscriptView {
 
     /// Feed a host-built row set through the normal plan/splice path without
     /// reading entries or `AppState`.
-    pub(crate) fn set_rows(
+    pub fn set_rows(
         &mut self,
         rows: Vec<Row>,
         mut meta: TranscriptMeta,

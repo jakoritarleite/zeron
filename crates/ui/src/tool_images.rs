@@ -200,7 +200,7 @@ struct Entry {
 }
 
 /// Where loads go: the engine and this device's id (remote owners relay).
-pub(crate) struct Loader {
+pub struct Loader {
     pub engine: Option<EngineHandle>,
     pub local_device: Option<String>,
 }

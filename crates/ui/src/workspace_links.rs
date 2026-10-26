@@ -85,7 +85,7 @@ pub(crate) struct WorkspaceFileLink {
 /// root — project roots carry no chat, so their links open in the linking
 /// chat's file context.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct FileLinkRoot {
+pub struct FileLinkRoot {
     pub chat: Option<String>,
     pub root: String,
     /// The owner lives on this device — the file is on this disk, so the

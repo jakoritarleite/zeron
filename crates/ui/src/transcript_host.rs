@@ -20,7 +20,7 @@ use crate::workspace_links::FileLinkRoot;
 
 /// Everything a transcript needs from its app. Object-safe: no generics and
 /// no `Self: Sized` methods.
-pub(crate) trait TranscriptHost {
+pub trait TranscriptHost {
     fn link_roots_revision(&self, cx: &App) -> u64;
     fn file_link_roots(&self, chat_id: &str, cx: &App) -> Vec<FileLinkRoot>;
     fn chat_is_local(&self, chat_id: &str, cx: &App) -> bool;
@@ -106,7 +106,7 @@ pub(crate) struct AppStateHost {
 }
 
 /// The facts a subagent doc's working trailer reads off its last entry.
-pub(crate) struct DocTrailer {
+pub struct DocTrailer {
     pub id: String,
     pub status: Option<zeron_doc::MessageStatus>,
     pub role: zeron_doc::MessageRole,

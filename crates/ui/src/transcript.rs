@@ -6,6 +6,7 @@
 //! helpers and tests, so callers keep their existing API while Phase 3 moves
 //! the view's data reads onto `TranscriptInput`.
 
+pub use crate::transcript_host::{DocTrailer, TranscriptHost};
 pub use crate::transcript_view::*;
 
 use gpui::{App, AppContext as _, Context, Entity, IntoElement, Render, Subscription, Window};
