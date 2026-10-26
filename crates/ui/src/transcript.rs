@@ -54,6 +54,7 @@ use crate::notice::{NoticeChipIcon::Tile, notice_chip};
 use crate::state::AppState;
 use crate::syntax_cache::{DocumentHighlightKey, SyntaxHighlightCache};
 use crate::theme::Theme;
+use crate::transcript_host::{AppStateHost, TranscriptHost};
 use zeron_syntax::LanguageId as Lang;
 
 // ---------------------------------------------------------------------------
@@ -3463,6 +3464,7 @@ impl SavedViewportCache {
 
 pub struct Transcript {
     state: Entity<AppState>,
+    host: Rc<dyn TranscriptHost>,
     list: ListState,
     rows: Vec<Row>,
     last_source: Option<(Option<String>, TranscriptReplayState, u64)>,
@@ -3758,7 +3760,7 @@ impl Transcript {
         cx: &mut Context<Self>,
     ) -> Option<render::LinkUi> {
         let roots = self.file_link_roots(source_chat_id, cx);
-        let source_local = self.state.read(cx).chat_is_local(source_chat_id);
+        let source_local = self.host.chat_is_local(source_chat_id, cx);
         self.workspace_link.clone().map(|mut link| {
             link.source_session = Some(source_chat_id.to_string());
             link.source_local = source_local;
@@ -3776,14 +3778,15 @@ impl Transcript {
         chat_id: &SharedString,
         cx: &gpui::App,
     ) -> Rc<Vec<crate::workspace_links::FileLinkRoot>> {
-        let state = self.state.read(cx);
-        let (revision, memo) = &mut self.file_link_roots;
-        if *revision != state.link_roots_revision {
-            *revision = state.link_roots_revision;
+        let revision = self.host.link_roots_revision(cx);
+        let host = &self.host;
+        let (memo_revision, memo) = &mut self.file_link_roots;
+        if *memo_revision != revision {
+            *memo_revision = revision;
             memo.clear();
         }
         memo.entry(chat_id.clone())
-            .or_insert_with(|| Rc::new(state.file_link_roots(chat_id)))
+            .or_insert_with(|| Rc::new(host.file_link_roots(chat_id, cx)))
             .clone()
     }
 
@@ -3804,7 +3807,7 @@ impl Transcript {
         let Some(roots) = ui.file_roots.as_deref() else {
             return tree.clone();
         };
-        let revision = self.state.read(cx).link_roots_revision;
+        let revision = self.host.link_roots_revision(cx);
         if self.inline_code_links.set_revision(revision) {
             self.render_cache.borrow_mut().clear();
         }
@@ -3863,6 +3866,7 @@ impl Transcript {
             ListAlignment::Bottom
         };
         let list = ListState::new(0, alignment, px(OVERDRAW_PX));
+        let host: Rc<dyn TranscriptHost> = Rc::new(AppStateHost::new(state.clone()));
         let weak = cx.weak_entity();
         list.set_scroll_handler(move |event: &ListScrollEvent, _window, cx| {
             weak.update(cx, |this: &mut Transcript, cx| {
@@ -3901,6 +3905,7 @@ impl Transcript {
         let pinned = follow;
         let mut this = Self {
             state,
+            host,
             list,
             rows: Vec::new(),
             last_source: None,
@@ -5616,31 +5621,19 @@ impl Transcript {
             Some(BlobFetch::Loading(_)) => return,
             Some(BlobFetch::Failed) | None => {}
         }
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        if !self.host.engine_available(cx) {
             return;
-        };
+        }
         let is_diff = blob_ref.ends_with(".diff");
         let ref_key = blob_ref.clone();
+        let host = self.host.clone();
+        let task_ref = ref_key.clone();
         let task = cx.spawn(async move |this, cx| {
-            let reply = crate::attachments::call_with_timeout(
-                &engine,
-                cx.background_executor(),
-                zeron_rpc::methods::FETCH_TOOL_BLOB,
-                serde_json::json!({ "blobRef": ref_key.as_ref() }),
-                Duration::from_secs(20),
-            )
-            .await;
-            let fetched = match reply {
-                Ok(value) => {
-                    let text = value
-                        .get("text")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or_default();
-                    blob_detail(text, is_diff)
-                        .map(|d| BlobFetch::Ready(Arc::new(d)))
-                        .unwrap_or(BlobFetch::Failed)
-                }
-                Err(_) => BlobFetch::Failed,
+            let fetched = match host.fetch_tool_blob(task_ref, cx).await {
+                Some(text) => blob_detail(&text, is_diff)
+                    .map(|d| BlobFetch::Ready(Arc::new(d)))
+                    .unwrap_or(BlobFetch::Failed),
+                None => BlobFetch::Failed,
             };
             this.update(cx, |this, cx| {
                 this.blob_details.insert(ref_key, fetched);
@@ -5932,23 +5925,13 @@ impl Transcript {
         if self.doc_override.is_some() {
             return Vec::new();
         }
-        let state = self.state.read(cx);
-        let mut ids = Vec::new();
-        if let Some(chat) = state.selected_chat_row() {
-            ids.push(chat.device_id.clone());
-        }
-        if let Some(local) = state.local_device_id.clone()
-            && !ids.contains(&local)
-        {
-            ids.push(local);
-        }
-        ids
+        self.host.attachment_device_ids(cx)
     }
 
     fn generated_attachment_device_ids(&self, owner: &str, cx: &Context<Self>) -> Vec<String> {
         let mut fallback = self.attachment_device_ids(cx);
-        if let Some(local) = &self.state.read(cx).local_device_id {
-            fallback.push(local.clone());
+        if let Some(local) = self.host.local_device_id(cx) {
+            fallback.push(local);
         }
         generated_image_devices(owner, &fallback)
     }
@@ -6023,30 +6006,20 @@ impl Transcript {
         expected_raster_mime: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        use crate::attachments::{
-            AttachmentKey, read_attachment_image, store_error_for, store_loaded_for,
-        };
+        use crate::attachments::{AttachmentKey, store_error_for, store_loaded_for};
         let key = AttachmentKey::new(&device_id, &path, expected_raster_mime.as_deref());
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        if !self.host.engine_available(cx) {
             store_error_for(&key);
             return;
-        };
-        let local = self.state.read(cx).local_device_id.clone();
-        // Relay-forward only for a genuinely remote owner; the local device's
-        // files are served directly.
-        let target = (local.as_deref() != Some(device_id.as_str())).then(|| device_id.clone());
+        }
+        let host = self.host.clone();
         let claim = crate::attachments::AttachmentLoadGuard(key.clone());
         let task_key = key.clone();
         let task = cx.spawn(async move |this, cx| {
             let _claim = claim;
-            match read_attachment_image(
-                &engine,
-                cx.background_executor(),
-                target.as_deref(),
-                &path,
-                expected_raster_mime.as_deref(),
-            )
-            .await
+            match host
+                .read_attachment_image(device_id, path, expected_raster_mime, cx)
+                .await
             {
                 Some(loaded) => store_loaded_for(&task_key, loaded.name.into(), loaded.image),
                 None => store_error_for(&task_key),
@@ -6124,10 +6097,10 @@ impl Transcript {
             .and_then(|rest| rest.split_once('/'))
             .map(|(id, _)| id);
         let percent = upload_id
-            .and_then(|id| self.state.read(cx).transfer_percent(id))
+            .and_then(|id| self.host.transfer_percent(id, cx))
             .or_else(|| {
                 sending
-                    .then(|| self.state.read(cx).upload_progress_percent())
+                    .then(|| self.host.upload_progress_percent(cx))
                     .flatten()
             });
         (sending, percent)
@@ -6208,16 +6181,7 @@ impl Transcript {
     /// The chat whose agent produced these rows (a subagent tab borrows the
     /// selected chat's host and cwd).
     fn image_host(&self, cx: &gpui::App) -> (Option<String>, Option<String>) {
-        let state = self.state.read(cx);
-        let chat = self
-            .chat_id
-            .as_deref()
-            .and_then(|id| state.chats.iter().find(|chat| chat.id == id))
-            .or_else(|| state.selected_chat_row());
-        (
-            chat.map(|chat| chat.device_id.clone()),
-            chat.and_then(|chat| chat.cwd.clone()),
-        )
+        self.host.image_host(self.chat_id.as_deref(), cx)
     }
 
     /// Hold the previews of every chip whose body is mounted; release the
@@ -6234,10 +6198,7 @@ impl Transcript {
             return vec![None; tools.len()];
         }
         let (device, cwd) = self.image_host(cx);
-        let loader = crate::tool_images::Loader {
-            engine: self.state.read(cx).engine().cloned(),
-            local_device: self.state.read(cx).local_device_id.clone(),
-        };
+        let loader = self.host.tool_image_loader(cx);
         tools
             .iter()
             .enumerate()
@@ -6457,18 +6418,14 @@ impl Transcript {
 
     /// Copy the original file (not the preview) from its owning device.
     fn copy_image(&mut self, path: String, devices: Vec<String>, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        if !self.host.engine_available(cx) {
             return;
-        };
-        let local = self.state.read(cx).local_device_id.clone();
+        }
+        let host = self.host.clone();
         self.image_copy = Some(cx.spawn(async move |this, cx| {
             let executor = cx.background_executor().clone();
             for device in &devices {
-                let target = (local.as_deref() != Some(device.as_str())).then_some(device.as_str());
-                if let Some((_, mime, bytes)) = crate::attachments::read_attachment_bytes(
-                    &engine, &executor, target, &path, None,
-                )
-                .await
+                if let Some((_, mime, bytes)) = host.read_attachment_bytes(device, &path, cx).await
                 {
                     let format =
                         gpui::ImageFormat::from_mime_type(&mime).unwrap_or(gpui::ImageFormat::Png);
@@ -6911,21 +6868,13 @@ impl Transcript {
         let frame = match self.visuals.get(row_id) {
             Some(frame) => frame.clone(),
             None => {
-                let state = self.state.read(cx);
-                let engine = state.engine().cloned();
-                // Relay-forward only for a genuinely remote owner.
-                let target =
-                    (state.local_device_id.as_deref() != Some(owner)).then(|| owner.to_owned());
-                let frame = cx.new(|cx| {
-                    crate::visuals::VisualFrame::new(
-                        row_id.clone(),
-                        title.to_owned(),
-                        path.to_owned(),
-                        engine,
-                        target,
-                        cx,
-                    )
-                });
+                let frame = self.host.visual_frame(
+                    row_id.clone(),
+                    title.to_owned(),
+                    path.to_owned(),
+                    owner,
+                    cx,
+                );
                 // A visual whose tree changes shape (a tab switch, a load)
                 // resizes its row, like a diagram finishing.
                 let id = row_id.clone();
@@ -7257,24 +7206,7 @@ impl Transcript {
         let Some(chat_id) = self.chat_id.clone() else {
             return;
         };
-        let engine = self.state.read(cx).engine().cloned();
-        self.state.update(cx, |s, cx| {
-            s.retry_pending_send(&chat_id, chrono::Utc::now());
-            cx.notify();
-        });
-        if let Some(engine) = engine {
-            cx.spawn(async move |_, _| {
-                let params = serde_json::json!({ "chatId": chat_id });
-                if let Err(err) = engine
-                    .client()
-                    .call(zeron_rpc::methods::RETRY_DELIVERY, params)
-                    .await
-                {
-                    tracing::warn!(error = %err, "delivery retry RPC failed");
-                }
-            })
-            .detach();
-        }
+        self.host.retry_send(&chat_id, chrono::Utc::now(), cx);
     }
 
     fn render_working_trailer(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -7292,20 +7224,25 @@ impl Transcript {
             if !self.doc_live {
                 return None;
             }
-            let state = self.state.read(cx);
-            let last = state.sub_transcript(doc_id).last()?;
-            let live =
-                last.status == Some(MessageStatus::Streaming) || last.role == MessageRole::User;
+            let trailer = self.host.doc_trailer(doc_id, cx)?;
+            let live = trailer.status == Some(MessageStatus::Streaming)
+                || trailer.role == MessageRole::User;
             if !live {
                 return None;
             }
-            let elapsed = ((now.timestamp_millis() - last.created_at).max(0) / 1000) as i64;
-            (false, false, elapsed, flavour_seed(doc_id), last.created_at)
+            let elapsed = ((now.timestamp_millis() - trailer.created_at).max(0) / 1000) as i64;
+            (
+                false,
+                false,
+                elapsed,
+                flavour_seed(doc_id),
+                trailer.created_at,
+            )
         } else {
             let chat_id = self.chat_id.clone()?;
             // Failed-send state first: past the grace window the trailer IS
             // the retry affordance, whatever the indicator fell back to.
-            if self.state.read(cx).send_undelivered(&chat_id, now) {
+            if self.host.send_undelivered(&chat_id, now, cx) {
                 let theme = Theme::of(cx).clone();
                 return Some(
                     div()
@@ -7324,8 +7261,7 @@ impl Transcript {
                 );
             }
             let (sending, queued, elapsed, turn) = {
-                let state = self.state.read(cx);
-                if state.indicator_for(&chat_id, now) != crate::state::Indicator::Working {
+                if self.host.indicator_for(&chat_id, now, cx) != crate::state::Indicator::Working {
                     return None;
                 }
                 // During the send→turn window the session row's `started_at`
@@ -7334,14 +7270,14 @@ impl Transcript {
                 // turn actually began (user report). Bridge it as "Sending…"
                 // with no timer instead; the word + timer start with the
                 // turn.
-                let turn_started = state.session_for(&chat_id).and_then(|s| s.started_at);
-                let send_started = state.pending_send_started(&chat_id, now);
+                let turn_started = self.host.session_started_at(&chat_id, cx);
+                let send_started = self.host.pending_send_started(&chat_id, now, cx);
                 let sending = sending_bridge(send_started, turn_started);
                 // Degraded delivery path: the send is a durable local write
                 // waiting on connectivity — say so instead of faking
                 // progress. (The overlay holds while degraded, so this line
                 // owns the surface until the ack or the failed state.)
-                let queued = sending && state.chat_delivery_degraded(&chat_id);
+                let queued = sending && self.host.chat_delivery_degraded(&chat_id, cx);
                 let elapsed = turn_started
                     .map(|t| now.signed_duration_since(t).num_seconds().max(0))
                     .unwrap_or(0);
@@ -7356,19 +7292,9 @@ impl Transcript {
         };
         if self.compact_mode && !sending && !queued && elapsed_secs > 0 {
             let entry_id = if let Some(doc_id) = &self.doc_override {
-                self.state
-                    .read(cx)
-                    .sub_transcript(doc_id)
-                    .last()
-                    .map(|e| e.id.clone())
+                self.host.doc_trailer(doc_id, cx).map(|trailer| trailer.id)
             } else {
-                self.state
-                    .read(cx)
-                    .transcript
-                    .iter()
-                    .rev()
-                    .find(|e| e.role == MessageRole::Assistant)
-                    .map(|e| e.id.clone())
+                self.host.last_assistant_id(cx)
             };
             if let Some(entry_id) = entry_id {
                 self.compact_last_elapsed.insert(entry_id, elapsed_secs);
@@ -7441,15 +7367,7 @@ impl Transcript {
         };
         self.rendered_rows.insert(row.id.clone());
         let theme = Theme::of(cx).clone();
-        let workspace_root = {
-            let state = self.state.read(cx);
-            self.chat_id
-                .as_deref()
-                .and_then(|chat_id| state.chats.iter().find(|chat| chat.id == chat_id))
-                .or_else(|| state.selected_chat_row())
-                .and_then(|chat| chat.cwd.as_deref())
-                .map(SharedString::from)
-        };
+        let workspace_root = self.host.workspace_root(self.chat_id.as_deref(), cx);
         // The viewport spans the full window (under the titlebar): the first
         // row's gap adds the titlebar's height so a top-scrolled transcript
         // rests below the chrome it fades under. The right pane already pads
