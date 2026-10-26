@@ -80,6 +80,13 @@ pub(crate) trait TranscriptHost {
         owner: &str,
         cx: &mut App,
     ) -> Entity<VisualFrame>;
+
+    /// The backing app state, for test fixtures that drive a bare
+    /// `TranscriptView` without the shell-facing handle.
+    #[cfg(test)]
+    fn state_entity(&self) -> Option<&Entity<AppState>> {
+        None
+    }
 }
 
 pub(crate) struct AppStateHost {
@@ -340,5 +347,10 @@ impl TranscriptHost for AppStateHost {
         // Relay-forward only for a genuinely remote owner.
         let target = (state.local_device_id.as_deref() != Some(owner)).then(|| owner.to_owned());
         cx.new(|cx| VisualFrame::new(id, title, path, engine, target, cx))
+    }
+
+    #[cfg(test)]
+    fn state_entity(&self) -> Option<&Entity<AppState>> {
+        Some(&self.state)
     }
 }

@@ -412,10 +412,8 @@ impl TranscriptView {
         if !self.rail_enabled() {
             return gpui::Empty.into_any_element();
         }
-        let (entries, echoes) = {
-            let state = self.state_entity().read(cx);
-            (state.transcript.clone(), state.pending_echoes().to_vec())
-        };
+        let entries = self.input.entries.clone();
+        let echoes = self.input.pending_echoes.clone();
         let ticks = rail_ticks(&entries, &echoes);
         // Map each tick to its transcript row (user rows share the entry id).
         let pairs: Vec<(RailTick, usize)> = ticks

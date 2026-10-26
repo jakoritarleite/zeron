@@ -8,7 +8,7 @@
 
 pub use crate::transcript_view::*;
 
-use gpui::{App, AppContext as _, Context, Entity, IntoElement, Render, Window};
+use gpui::{App, AppContext as _, Context, Entity, IntoElement, Render, Subscription, Window};
 
 use crate::state::AppState;
 
@@ -44,6 +44,22 @@ mod tests {
     use crate::transcript_host::{AppStateHost, TranscriptHost};
     use zeron_syntax::LanguageId as Lang;
 
+    /// Push a fresh snapshot from the fixture's app state before syncing: the
+    /// view no longer reads `AppState` itself.
+    fn test_sync(view: &mut TranscriptView, cx: &mut Context<TranscriptView>) {
+        let state = view
+            .host
+            .state_entity()
+            .expect("test view is backed by AppState")
+            .clone();
+        let doc_override = view.doc_override.clone();
+        {
+            let state = state.read(cx);
+            view.set_input(TranscriptInput::new(&state, doc_override.as_deref()));
+        }
+        view.sync(cx);
+    }
+
     #[test]
     fn jump_button_stays_available_when_scrolling_down_until_near_bottom() {
         let mut shown = false;
@@ -71,13 +87,13 @@ mod tests {
                 transcript.last_source = None;
                 transcript.rows = vec![viewport_row("row", "message")];
                 transcript.list.reset(1);
-                transcript.sync(cx);
+                test_sync(transcript, cx);
                 assert_eq!(transcript.rows.len(), 1);
-                assert!(transcript.route_exit_pending(cx));
+                assert!(transcript.route_exit_pending());
                 transcript.finish_route_exit(cx);
                 assert!(transcript.rows.is_empty());
                 assert!(transcript.chat_id.is_none());
-                assert!(!transcript.route_exit_pending(cx));
+                assert!(!transcript.route_exit_pending());
             });
         });
     }
@@ -116,7 +132,7 @@ mod tests {
             )];
             state.transcript_revision += 1;
         });
-        transcript.update(cx, |this, cx| this.sync(cx));
+        transcript.update(cx, |this, cx| test_sync(this, cx));
     }
 
     fn assert_replayed_group_is_closed(transcript: &Entity<TranscriptView>, cx: &mut gpui::App) {
@@ -192,13 +208,13 @@ mod tests {
                 });
                 state.update(cx, |state, cx| state.select_chat(None, cx));
                 transcript.update(cx, |this, cx| {
-                    this.sync(cx);
+                    test_sync(this, cx);
                     if finish_exit {
                         this.finish_route_exit(cx);
                     }
                 });
                 state.update(cx, |state, cx| state.select_chat(Some("chat-a".into()), cx));
-                transcript.update(cx, |this, cx| this.sync(cx));
+                transcript.update(cx, |this, cx| test_sync(this, cx));
                 replay_tool_group(&state, &transcript, "chat-a", cx);
                 assert_replayed_group_is_closed(&transcript, cx);
             }
@@ -225,7 +241,7 @@ mod tests {
                         )
                         .unwrap();
                 });
-                transcript.update(cx, |this, cx| this.sync(cx));
+                transcript.update(cx, |this, cx| test_sync(this, cx));
             };
             let cached = vec![assistant(
                 "tools",
@@ -238,7 +254,7 @@ mod tests {
                 cx,
             );
             state.update(cx, |state, cx| state.select_chat(Some("chat-b".into()), cx));
-            transcript.update(cx, |this, cx| this.sync(cx));
+            transcript.update(cx, |this, cx| test_sync(this, cx));
 
             // The agent does this work while A is away. On return, a stale
             // local snapshot can arrive before remote catch-up deltas. Keep
@@ -256,7 +272,7 @@ mod tests {
             ]);
 
             state.update(cx, |state, cx| state.select_chat(Some("chat-a".into()), cx));
-            transcript.update(cx, |this, cx| this.sync(cx));
+            transcript.update(cx, |this, cx| test_sync(this, cx));
             assert!(
                 !transcript.read(cx).rows.is_empty(),
                 "revisited transcript must have visible rows before the new watch responds"
@@ -375,7 +391,7 @@ mod tests {
         }).join().unwrap();
         with_tool_group_navigation(cx, |state, transcript, cx| {
             state.update(cx, |state, cx| state.select_chat(Some("whale".into()), cx));
-            transcript.update(cx, |this, cx| this.sync(cx));
+            transcript.update(cx, |this, cx| test_sync(this, cx));
             FORBID_ROW_PREPARATION.with(|flag| flag.set(true));
             let start = Instant::now();
             state.update(cx, |state, cx| {
@@ -386,7 +402,7 @@ mod tests {
                     .prepared_transcripts
                     .insert("whale".into(), prepared.clone());
             });
-            transcript.update(cx, |this, cx| this.sync(cx));
+            transcript.update(cx, |this, cx| test_sync(this, cx));
             let open_ms = start.elapsed().as_millis();
             assert!(!transcript.read(cx).rows.is_empty());
             assert!(
@@ -398,9 +414,9 @@ mod tests {
             );
             let start = Instant::now();
             state.update(cx, |state, cx| state.select_chat(None, cx));
-            transcript.update(cx, |this, cx| this.sync(cx));
+            transcript.update(cx, |this, cx| test_sync(this, cx));
             state.update(cx, |state, cx| state.select_chat(Some("whale".into()), cx));
-            transcript.update(cx, |this, cx| this.sync(cx));
+            transcript.update(cx, |this, cx| test_sync(this, cx));
             let revisit_ms = start.elapsed().as_millis();
             assert!(Arc::ptr_eq(
                 &state.read(cx).prepared_transcripts["whale"],
@@ -426,7 +442,7 @@ mod tests {
     ) {
         with_tool_group_navigation(cx, |state, transcript, cx| {
             state.update(cx, |state, cx| state.select_chat(Some("whale".into()), cx));
-            transcript.update(cx, |this, cx| this.sync(cx));
+            transcript.update(cx, |this, cx| test_sync(this, cx));
             let preview = vec![assistant(
                 "turn",
                 MessageStatus::Streaming,
@@ -460,7 +476,7 @@ mod tests {
                         )
                         .unwrap();
                 });
-                transcript.update(cx, |this, cx| this.sync(cx));
+                transcript.update(cx, |this, cx| test_sync(this, cx));
             };
             let assert_settled = |expected_tools, cx: &mut gpui::App| {
                 let this = transcript.read(cx);
@@ -490,9 +506,9 @@ mod tests {
             assert_settled(2, cx);
             for _ in 0..3 {
                 state.update(cx, |state, cx| state.select_chat(Some("away".into()), cx));
-                transcript.update(cx, |this, cx| this.sync(cx));
+                transcript.update(cx, |this, cx| test_sync(this, cx));
                 state.update(cx, |state, cx| state.select_chat(Some("whale".into()), cx));
-                transcript.update(cx, |this, cx| this.sync(cx));
+                transcript.update(cx, |this, cx| test_sync(this, cx));
                 assert_settled(2, cx);
                 apply(&preview, true, cx); // ignored because the cache is complete
                 assert_settled(2, cx);
@@ -513,7 +529,7 @@ mod tests {
                     )
                     .unwrap();
             });
-            transcript.update(cx, |this, cx| this.sync(cx));
+            transcript.update(cx, |this, cx| test_sync(this, cx));
             let this = transcript.read(cx);
             let tail = &this.tool_group_reveals[&SharedString::from("turn#g1")];
             assert!(tail.header_started_at.is_none());
@@ -565,7 +581,7 @@ mod tests {
                     .unwrap();
             });
             transcript.update(cx, |this, cx| {
-                this.sync(cx);
+                test_sync(this, cx);
                 let reveal = &this.tool_group_reveals[&SharedString::from("tools#g0")];
                 assert!(reveal.header_started_at.is_none());
                 assert!(reveal.starts[..2].iter().all(Option::is_none));
@@ -599,7 +615,7 @@ mod tests {
                         )
                         .unwrap();
                 });
-                transcript.update(cx, |this, cx| this.sync(cx));
+                transcript.update(cx, |this, cx| test_sync(this, cx));
             };
             // Two live tools are already animating when older work arrives
             // before and between them in the same group.
@@ -656,7 +672,7 @@ mod tests {
                     )
                     .unwrap();
             });
-            transcript.update(cx, |this, cx| this.sync(cx));
+            transcript.update(cx, |this, cx| test_sync(this, cx));
             let live = vec![assistant(
                 "first",
                 MessageStatus::Streaming,
@@ -675,7 +691,7 @@ mod tests {
                     .unwrap();
             });
             transcript.update(cx, |this, cx| {
-                this.sync(cx);
+                test_sync(this, cx);
                 let reveal = &this.tool_group_reveals[&SharedString::from("first#g0")];
                 assert!(reveal.header_started_at.is_some());
                 assert!(reveal.starts[0].is_some());
@@ -709,7 +725,7 @@ mod tests {
                     .unwrap();
             });
             transcript.update(cx, |this, cx| {
-                this.sync(cx);
+                test_sync(this, cx);
                 for ix in 0..5 {
                     let reveal =
                         &this.tool_group_reveals[&SharedString::from(format!("live-{ix}#g0"))];
@@ -733,7 +749,7 @@ mod tests {
                 );
             });
             state.update(cx, |state, cx| state.select_chat(None, cx));
-            transcript.update(cx, |this, cx| this.sync(cx));
+            transcript.update(cx, |this, cx| test_sync(this, cx));
             // Cached replay can land without an intervening pending frame.
             replay_tool_group(&state, &transcript, "chat-a", cx);
             transcript.update(cx, |this, cx| {
@@ -775,7 +791,7 @@ mod tests {
                 state.transcript_revision += 1;
             });
             transcript.update(cx, |this, cx| {
-                this.sync(cx);
+                test_sync(this, cx);
                 let row = this.rows.last().unwrap().clone();
                 let RowKind::ToolGroup {
                     tools,
@@ -2179,7 +2195,7 @@ mod tests {
             transcript.update(cx, |this, cx| {
                 this.compact_mode = true;
                 this.last_source = None;
-                this.sync(cx);
+                test_sync(this, cx);
             });
             let work_id: SharedString = "a1#work".into();
             let folded = |this: &TranscriptView| {
@@ -2873,7 +2889,7 @@ mod tests {
                     vec![text_part("body", "historial fuera de pantalla")],
                 )];
                 transcript.update(cx, |this, cx| {
-                    this.state.update(cx, |state, cx| {
+                    this.host.state_entity().unwrap().update(cx, |state, cx| {
                         state.select_chat(Some("chat".into()), cx);
                         state
                             .receive_transcript_update(
@@ -2888,7 +2904,7 @@ mod tests {
                             )
                             .unwrap();
                     });
-                    this.sync(cx);
+                    test_sync(this, cx);
                     assert!(this.veils.is_empty(), "opening text has not been painted");
                 });
                 let recovered = assistant(
@@ -2902,7 +2918,7 @@ mod tests {
                 let mut cutoff = history.clone();
                 cutoff.push(recovered);
                 transcript.update(cx, |this, cx| {
-                    this.state.update(cx, |state, cx| {
+                    this.host.state_entity().unwrap().update(cx, |state, cx| {
                         state
                             .receive_transcript_update(
                                 zeron_doc::TranscriptUpdate {
@@ -2918,7 +2934,7 @@ mod tests {
                             )
                             .unwrap();
                     });
-                    this.sync(cx);
+                    test_sync(this, cx);
                 });
                 cx.update_window(window.into(), |_, window, cx| {
                     transcript.update(cx, |this, cx| {
@@ -2956,7 +2972,7 @@ mod tests {
                     vec![text_part("body", "café histórico y nuevo\n\nOtro párrafo")],
                 )];
                 transcript.update(cx, |this, cx| {
-                    this.state.update(cx, |state, cx| {
+                    this.host.state_entity().unwrap().update(cx, |state, cx| {
                         state.select_chat(Some("chat".into()), cx);
                         state
                             .receive_transcript_update(
@@ -2981,7 +2997,7 @@ mod tests {
                             )
                             .unwrap();
                     });
-                    this.sync(cx);
+                    test_sync(this, cx);
                 });
                 cx.update_window(window.into(), |_, window, cx| {
                     transcript.update(cx, |this, cx| {
@@ -3019,7 +3035,7 @@ mod tests {
                 let mut next_history = history.clone();
                 next_history.push(recovered);
                 transcript.update(cx, |this, cx| {
-                    this.state.update(cx, |state, cx| {
+                    this.host.state_entity().unwrap().update(cx, |state, cx| {
                         state
                             .receive_transcript_update(
                                 zeron_doc::TranscriptUpdate {
@@ -3033,7 +3049,7 @@ mod tests {
                             )
                             .unwrap();
                     });
-                    this.sync(cx);
+                    test_sync(this, cx);
                     assert!(Rc::ptr_eq(
                         &veil,
                         &this.veils[&SharedString::from("reply#body.0")]
@@ -3125,7 +3141,7 @@ mod tests {
                         });
                         this.spring_kick = true;
                         updated.push(prompt(&format!("history-{}", updated.len())));
-                        this.state.update(cx, |state, cx| {
+                        this.host.state_entity().unwrap().update(cx, |state, cx| {
                             let frame = zeron_doc::diff_transcript(&state.transcript, &updated);
                             state
                                 .receive_transcript_update(
@@ -3140,7 +3156,7 @@ mod tests {
                                 )
                                 .unwrap();
                         });
-                        this.sync(cx);
+                        test_sync(this, cx);
                         if !pinned {
                             let offset = this.list.logical_scroll_top();
                             assert_eq!(offset.item_ix, 5);
@@ -3238,13 +3254,13 @@ mod tests {
             entries: Vec<SessionMessageEntry>,
             cx: &mut Context<TranscriptView>,
         ) {
-            this.state.update(cx, |state, _| {
+            this.host.state_entity().unwrap().update(cx, |state, _| {
                 state.selected_chat = Some("chat".into());
                 state.transcript_replayed = true;
                 state.transcript = entries;
                 state.transcript_revision += 1;
             });
-            this.sync(cx);
+            test_sync(this, cx);
         }
 
         fn prompt(id: &str) -> SessionMessageEntry {
@@ -3369,7 +3385,7 @@ mod tests {
                 transcript.update(cx, |this, cx| {
                     feed(this, vec![prompt("prompt")], cx);
                     this.rail_enabled = false;
-                    this.state.update(cx, |state, _| {
+                    this.host.state_entity().unwrap().update(cx, |state, _| {
                         state.sessions.push(zeron_proto::Session {
                             last_completed_turn: None,
                             running_subagents: 0,
@@ -3781,7 +3797,7 @@ mod tests {
                 assert!(!transcript.read(cx).own_turn.as_ref().unwrap().held);
                 let before = transcript.read(cx).list.logical_scroll_top();
                 transcript.update(cx, |this, cx| {
-                    let mut entries = this.state.read(cx).transcript.clone();
+                    let mut entries = this.host.state_entity().unwrap().read(cx).transcript.clone();
                     entries.push(assistant(
                         "reply",
                         MessageStatus::Streaming,
@@ -3991,7 +4007,7 @@ mod tests {
                         assert!(!transcript.read(cx).pinned);
                         let before = transcript.read(cx).list.logical_scroll_top();
                         transcript.update(cx, |this, cx| {
-                            let mut entries = this.state.read(cx).transcript.clone();
+                            let mut entries = this.host.state_entity().unwrap().read(cx).transcript.clone();
                             entries.push(assistant(
                                 "reply",
                                 MessageStatus::Streaming,
@@ -5813,13 +5829,13 @@ mod tests {
 }
 
 
-/// Shell-facing transcript handle. Phase 2: a thin wrapper over the view
-/// entity; the view still reads `AppState` until `TranscriptInput` lands.
+/// Shell-facing transcript handle. Owns the app state, derives a
+/// [`TranscriptInput`] snapshot from it and pushes it into the view.
 pub struct Transcript {
     view: Entity<TranscriptView>,
-    /// Retained for Phase 3's `TranscriptInput`; the view is still the reader.
-    #[allow(dead_code)]
     state: Entity<AppState>,
+    _observe: Subscription,
+    _text_changes: Subscription,
 }
 
 impl gpui::EventEmitter<TranscriptEvent> for Transcript {}
@@ -5851,7 +5867,39 @@ impl Transcript {
             cx.emit(event.clone())
         })
         .detach();
-        Self { view, state }
+        let _observe = cx.observe(&state, |this: &mut Self, _, cx| this.sync(cx));
+        let _text_changes = cx.subscribe(
+            &state,
+            |this: &mut Self, state, event: &crate::state::TranscriptTextChanged, cx| {
+                let doc_override = this.view.read(cx).doc_override.clone();
+                let doc_id = doc_override.or_else(|| state.read(cx).selected_chat.clone());
+                if doc_id.as_deref() == Some(event.doc_id.as_str()) {
+                    this.sync(cx);
+                }
+            },
+        );
+        let mut this = Self {
+            view,
+            state,
+            _observe,
+            _text_changes,
+        };
+        this.sync(cx);
+        this
+    }
+
+    /// Build a snapshot outside `AppState`'s borrow, then let the view derive
+    /// rows: reading the entity and updating the view both need `cx`.
+    fn sync(&mut self, cx: &mut Context<Self>) {
+        let doc_override = self.view.read(cx).doc_override.clone();
+        let state = self.state.clone();
+        self.view.update(cx, |view, cx| {
+            {
+                let state = state.read(cx);
+                view.set_input(TranscriptInput::new(&state, doc_override.as_deref()));
+            }
+            view.sync(cx);
+        });
     }
 
     pub(crate) fn set_workspace_link_handler(
@@ -5869,6 +5917,9 @@ impl Transcript {
     }
 
     pub(crate) fn finish_route_exit(&mut self, cx: &mut Context<Self>) {
+        // Refresh the snapshot first: the shell renders this on the frame the
+        // selection clears, possibly before our observer callback runs.
+        self.sync(cx);
         self.view
             .update(cx, |view, cx| view.finish_route_exit(cx));
     }

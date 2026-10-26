@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use gpui::{
     AnyElement, Bounds, ClipboardItem, ContentMask, Context, Entity, ListAlignment, ListOffset,
     ListScrollEvent, ListState, MouseButton, MouseMoveEvent, MouseUpEvent, ObjectFit, PathBuilder,
-    Pixels, Point, SharedString, StyledImage as _, StyledText, Subscription, Task, TextAlign,
+    Pixels, Point, SharedString, StyledImage as _, StyledText, Task, TextAlign,
     TextRun, Window, canvas, div, img, list, point, prelude::*, px, size,
 };
 
@@ -3365,6 +3365,76 @@ impl TranscriptReplayState {
     }
 }
 
+/// One state-derived snapshot handed to [`TranscriptView`] by the shell-facing
+/// `Transcript` handle. Borrowed so the wrapper never owns a second copy of
+/// the view's data for longer than the push.
+pub(crate) struct TranscriptInput<'a> {
+    pub(crate) selected_chat: Option<&'a str>,
+    pub(crate) replay: TranscriptReplayState,
+    pub(crate) revision: u64,
+    pub(crate) entries: &'a [SessionMessageEntry],
+    pub(crate) pending_echoes: &'a [SessionMessageEntry],
+    pub(crate) prepared: Option<&'a Arc<PreparedTranscript>>,
+    pub(crate) baseline: Option<&'a Arc<zeron_doc::TranscriptBaseline>>,
+}
+
+impl<'a> TranscriptInput<'a> {
+    pub(crate) fn new(state: &'a AppState, doc_override: Option<&'a str>) -> Self {
+        let selected_chat = doc_override.or(state.selected_chat.as_deref());
+        let replay = if doc_override.is_some() {
+            TranscriptReplayState::Populated
+        } else if !state.transcript_replayed {
+            TranscriptReplayState::Pending
+        } else if state.transcript.is_empty() {
+            TranscriptReplayState::Empty
+        } else {
+            TranscriptReplayState::Populated
+        };
+        let entries = match doc_override {
+            Some(doc_id) => state.sub_transcript(doc_id),
+            None => state.transcript.as_slice(),
+        };
+        let pending_echoes = if doc_override.is_some() {
+            &[]
+        } else {
+            state.pending_echoes()
+        };
+        Self {
+            selected_chat,
+            replay,
+            revision: state.transcript_revision,
+            entries,
+            pending_echoes,
+            prepared: selected_chat.and_then(|id| state.prepared_transcripts.get(id)),
+            baseline: selected_chat.and_then(|id| state.transcript_baseline(id)),
+        }
+    }
+
+    fn into_snapshot(self) -> TranscriptSnapshot {
+        TranscriptSnapshot {
+            selected_chat: self.selected_chat.map(ToOwned::to_owned),
+            replay: self.replay,
+            revision: self.revision,
+            entries: Rc::new(self.entries.to_vec()),
+            pending_echoes: Rc::new(self.pending_echoes.to_vec()),
+            prepared: self.prepared.cloned(),
+            baseline: self.baseline.cloned(),
+        }
+    }
+}
+
+/// Owned form kept by the view: a fold toggle or compact-mode switch rebuilds
+/// rows from this snapshot instead of reaching back into `AppState`.
+pub(crate) struct TranscriptSnapshot {
+    pub(crate) selected_chat: Option<String>,
+    pub(crate) replay: TranscriptReplayState,
+    pub(crate) revision: u64,
+    pub(crate) entries: Rc<Vec<SessionMessageEntry>>,
+    pub(crate) pending_echoes: Rc<Vec<SessionMessageEntry>>,
+    pub(crate) prepared: Option<Arc<PreparedTranscript>>,
+    pub(crate) baseline: Option<Arc<zeron_doc::TranscriptBaseline>>,
+}
+
 impl ViewportFinalizeToken {
     pub(crate) fn still_current(self, generation: u64) -> bool {
         self.generation == generation
@@ -3463,7 +3533,9 @@ impl SavedViewportCache {
 }
 
 pub struct TranscriptView {
-    pub(crate) state: Entity<AppState>,
+    /// The last snapshot pushed by the shell-facing handle; built from
+    /// `AppState` there, never read directly by the view.
+    pub(crate) input: TranscriptSnapshot,
     pub(crate) host: Rc<dyn TranscriptHost>,
     pub(crate) list: ListState,
     pub(crate) rows: Vec<Row>,
@@ -3707,8 +3779,6 @@ pub struct TranscriptView {
     /// recently (click "Show full output" after a diff → see the output).
     pub(crate) blob_fetch_order: HashMap<SharedString, u64>,
     pub(crate) blob_fetch_counter: u64,
-    pub(crate) _observe: Subscription,
-    pub(crate) _text_changes: Subscription,
 }
 
 /// One sidecar blob fetch's lifecycle.
@@ -3866,6 +3936,9 @@ impl TranscriptView {
             ListAlignment::Bottom
         };
         let list = ListState::new(0, alignment, px(OVERDRAW_PX));
+        // Seed from the current app state so the first frame is populated;
+        // the shell-facing handle refreshes this snapshot afterwards.
+        let input = TranscriptInput::new(&state.read(cx), doc_override.as_deref()).into_snapshot();
         let host: Rc<dyn TranscriptHost> = Rc::new(AppStateHost::new(state.clone()));
         let weak = cx.weak_entity();
         list.set_scroll_handler(move |event: &ListScrollEvent, _window, cx| {
@@ -3874,25 +3947,12 @@ impl TranscriptView {
             })
             .ok();
         });
-        let observe = cx.observe(&state, |this: &mut Self, _, cx| this.sync(cx));
         cx.on_release(|this: &mut Self, cx| {
             this.close_diagram_zoom(cx);
             crate::image_media::release_media(this.diagrams.borrow_mut().drain(), cx);
             this.tool_images.clear(cx);
         })
         .detach();
-        let text_changes = cx.subscribe(
-            &state,
-            |this: &mut Self, state, event: &crate::state::TranscriptTextChanged, cx| {
-                let doc_id = this
-                    .doc_override
-                    .as_deref()
-                    .or_else(|| state.read(cx).selected_chat.as_deref());
-                if doc_id == Some(event.doc_id.as_str()) {
-                    this.sync(cx);
-                }
-            },
-        );
         // The rail is sized for the conversation column; a narrow right-pane
         // tab has no width gate driving it, so override instances skip it.
         let rail_enabled = doc_override.is_none();
@@ -3904,7 +3964,7 @@ impl TranscriptView {
         // wheel-up, and resticks/jumps exactly like the main transcript.
         let pinned = follow;
         let mut this = Self {
-            state,
+            input,
             host,
             list,
             rows: Vec::new(),
@@ -3997,8 +4057,6 @@ impl TranscriptView {
             blob_details: HashMap::new(),
             blob_fetch_order: HashMap::new(),
             blob_fetch_counter: 0,
-            _observe: observe,
-            _text_changes: text_changes,
         };
         this.sync(cx);
         this
@@ -4153,8 +4211,19 @@ impl TranscriptView {
         }
     }
 
-    pub(crate) fn state_entity(&self) -> &Entity<AppState> {
-        &self.state
+    /// Push the snapshot the shell-facing handle derived from `AppState`.
+    /// Ignores a snapshot the view has already synced; a resync is a no-op
+    /// unless the source (selection, replay readiness, revision) moved.
+    pub(crate) fn set_input(&mut self, input: TranscriptInput<'_>) {
+        let source = (
+            input.selected_chat.map(ToOwned::to_owned),
+            input.replay,
+            input.revision,
+        );
+        if self.last_source.as_ref() == Some(&source) {
+            return;
+        }
+        self.input = input.into_snapshot();
     }
 
     /// Hand viewport ownership to explicit rail/navigation input before its
@@ -4614,7 +4683,7 @@ impl TranscriptView {
     /// Advance the prompt glide or hand a filled reservation to tail-follow.
     /// Reservation sizing happens in the list layout, never in this callback.
     pub(crate) fn step_own_turn(&mut self, cx: &mut Context<Self>) {
-        if self.route_exit_pending(cx) {
+        if self.route_exit_pending() {
             return;
         }
         self.own_turn_kick = false;
@@ -4913,7 +4982,7 @@ impl TranscriptView {
     /// delta, and park on landing. Runs from `window.on_next_frame`,
     /// i.e. after layout — measurements are fresh.
     pub(crate) fn step_spring(&mut self, cx: &mut Context<Self>) {
-        if self.route_exit_pending(cx) {
+        if self.route_exit_pending() {
             return;
         }
         self.spring_kick = false;
@@ -4974,26 +5043,27 @@ impl TranscriptView {
         self.retain_on_deselect = true;
     }
 
-    pub(crate) fn route_exit_pending(&self, cx: &gpui::App) -> bool {
+    pub(crate) fn route_exit_pending(&self) -> bool {
         self.retain_on_deselect
             && self.doc_override.is_none()
-            && self.state.read(cx).selected_chat.is_none()
+            && self.input.selected_chat.is_none()
             && self.chat_id.is_some()
     }
 
     pub(crate) fn finish_route_exit(&mut self, cx: &mut Context<Self>) {
-        if self.state.read(cx).selected_chat.is_none() && self.chat_id.is_some() {
+        if self.input.selected_chat.is_none() && self.chat_id.is_some() {
             self.retain_on_deselect = false;
             self.sync(cx);
             self.retain_on_deselect = true;
         }
     }
 
-    /// Rebuild rows from app state; splice minimal ranges into the list.
+    /// Rebuild rows from the last pushed snapshot; splice minimal ranges into
+    /// the list.
     pub(crate) fn sync(&mut self, cx: &mut Context<Self>) {
         if self.retain_on_deselect
             && self.doc_override.is_none()
-            && self.state.read(cx).selected_chat.is_none()
+            && self.input.selected_chat.is_none()
             && self.chat_id.is_some()
         {
             // A quick return can reuse this entity before the exit finishes.
@@ -5001,31 +5071,13 @@ impl TranscriptView {
             self.veil_attach_pending = true;
             return;
         }
-        let (selected, replay) = {
-            let s = self.state.read(cx);
-            match &self.doc_override {
-                // Pinned to a subagent doc: `selected` equals `chat_id` by
-                // construction, so the attach/reset branch below never fires,
-                // and echoes stay empty (nothing is ever sent from here).
-                Some(doc_id) => (Some(doc_id.clone()), TranscriptReplayState::Populated),
-                None => {
-                    let replay = if !s.transcript_replayed {
-                        TranscriptReplayState::Pending
-                    } else if s.transcript.is_empty() {
-                        TranscriptReplayState::Empty
-                    } else {
-                        TranscriptReplayState::Populated
-                    };
-                    (s.selected_chat.clone(), replay)
-                }
-            }
-        };
+        // `selected` equals `chat_id` for a pinned subagent doc by
+        // construction, so the attach/reset branch below never fires, and
+        // echoes stay empty (nothing is ever sent from there).
+        let selected = self.input.selected_chat.clone();
+        let replay = self.input.replay;
 
-        let source = (
-            selected.clone(),
-            replay,
-            self.state.read(cx).transcript_revision,
-        );
+        let source = (selected.clone(), replay, self.input.revision);
         if self.last_source.as_ref() == Some(&source) {
             return;
         }
@@ -5120,23 +5172,15 @@ impl TranscriptView {
         }
 
         let mut new_rows: Vec<Row> = Vec::new();
-        // Borrow the transcript only while deriving rows. Cloning the entity
-        // handle lets rows_for mutate our caches without copying every text
-        // and tool payload on each app-state notification.
+        // Rc-clone the snapshot slices so `rows_for` can mutate our caches
+        // without copying every text and tool payload on each notification.
+        let entries = self.input.entries.clone();
+        let echoes = self.input.pending_echoes.clone();
+        let prepared = self.input.prepared.clone();
         let (entries_empty, tail_streaming) = {
-            let state = self.state.clone();
-            let state = state.read(cx);
-            let entries = match &self.doc_override {
-                Some(doc_id) => state.sub_transcript(doc_id),
-                None => state.transcript.as_slice(),
-            };
-            let prepared = self
-                .chat_id
-                .as_ref()
-                .and_then(|id| state.prepared_transcripts.get(id));
-            for entry in entries {
+            for entry in entries.iter() {
                 if !self.compact_mode
-                    && let Some(rows) = prepared.and_then(|p| p.rows.get(&entry.id))
+                    && let Some(rows) = prepared.as_ref().and_then(|p| p.rows.get(&entry.id))
                 {
                     new_rows.extend(rows.iter().cloned());
                 } else {
@@ -5144,7 +5188,7 @@ impl TranscriptView {
                 }
             }
             if self.doc_override.is_none() {
-                for echo in state.pending_echoes() {
+                for echo in echoes.iter() {
                     new_rows.extend(self.rows_for(echo, true));
                 }
             }
@@ -5156,11 +5200,7 @@ impl TranscriptView {
             )
         };
 
-        let baseline = self
-            .chat_id
-            .as_deref()
-            .and_then(|id| self.state.read(cx).transcript_baseline(id))
-            .cloned();
+        let baseline = self.input.baseline.clone();
         let baseline_changed = baseline.as_ref().is_some_and(|baseline| {
             self.last_replay_baseline
                 .as_ref()
@@ -5170,19 +5210,10 @@ impl TranscriptView {
         let mut fully_historical: HashSet<SharedString> = HashSet::new();
         if baseline_changed {
             let baseline = baseline.as_ref().unwrap();
-            let state = self.state.read(cx);
-            let entries = match &self.doc_override {
-                Some(id) => state.sub_transcript(id),
-                None => &state.transcript,
-            };
             let previous_markdown = std::mem::take(&mut self.historical_markdown);
-            let prepared = self
-                .chat_id
-                .as_ref()
-                .and_then(|id| state.prepared_transcripts.get(id));
             let mut historical_rows = Vec::new();
-            for entry in entries {
-                let covered = prepared.map_or_else(
+            for entry in entries.iter() {
+                let covered = prepared.as_ref().map_or_else(
                     || baseline.covers(entry),
                     |p| {
                         Arc::ptr_eq(baseline, &p.navigation_baseline)
@@ -5194,10 +5225,8 @@ impl TranscriptView {
                     continue;
                 }
                 if !self.compact_mode
-                    && let Some(rows) = self
-                        .chat_id
+                    && let Some(rows) = prepared
                         .as_ref()
-                        .and_then(|id| state.prepared_transcripts.get(id))
                         .and_then(|p| p.historical.get(&entry.id))
                 {
                     historical_rows.extend(rows.iter().cloned());
@@ -10414,7 +10443,7 @@ impl Render for TranscriptView {
         // frame while an anchor is live (not just on kicks) so viewport
         // resizes and streaming growth re-derive the reservation; the step
         // only notifies on change, so a settled hold schedules no next frame.
-        if !self.route_exit_pending(cx)
+        if !self.route_exit_pending()
             && (self.own_turn.is_some() || self.own_turn_kick)
             && !self.own_turn_scheduled
         {
@@ -10432,7 +10461,7 @@ impl Render for TranscriptView {
         // Spring driver: one on_next_frame callback at a time; each tick
         // notifies, which re-enters render and schedules the next frame until
         // the spring parks. Reduced motion never schedules (sync snaps).
-        if !self.route_exit_pending(cx)
+        if !self.route_exit_pending()
             && self.pinned
             && !motion::reduced_motion(cx)
             && !self.spring_scheduled
