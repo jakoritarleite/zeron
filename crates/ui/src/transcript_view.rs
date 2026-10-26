@@ -3685,6 +3685,29 @@ impl<'a> TranscriptInput<'a> {
     }
 }
 
+/// Rows-mode rail ticks: one per user row, keyed by the row id the rail maps
+/// back to. The reply preview reuses the assistant entry's settled copy text.
+fn rail_ticks_from_rows(rows: &[Row]) -> Vec<RailTick> {
+    rows.iter()
+        .enumerate()
+        .filter_map(|(ix, row)| {
+            let RowKind::User { text, .. } = &row.kind else {
+                return None;
+            };
+            let reply = rows[ix + 1..]
+                .iter()
+                .take_while(|next| !matches!(next.kind, RowKind::User { .. }))
+                .find_map(|next| next.copy_text.clone())
+                .map(|text| text.to_string());
+            Some(RailTick {
+                message_id: row.id.to_string(),
+                prompt: text.to_string(),
+                reply,
+            })
+        })
+        .collect()
+}
+
 /// Owned entries, materialized on demand (compact flips, fold rebuilds, route
 /// exit) and dropped at the end of that sync.
 pub struct TranscriptSnapshot {
@@ -4637,6 +4660,9 @@ impl TranscriptView {
             meta.selected_chat = self.doc_override.clone();
         }
         self.last_source = Some((meta.selected_chat.clone(), meta.replay, meta.revision));
+        if meta.rail_ticks.is_empty() {
+            meta.rail_ticks = rail_ticks_from_rows(&rows);
+        }
         self.meta = meta;
         let plan = self.plan_source(RowData::Rows(rows));
         self.apply_plan(plan, cx);
@@ -11174,5 +11200,69 @@ impl TranscriptView {
         if let Some(action) = action {
             self.dispatch_image_menu(action, cx);
         }
+    }
+}
+
+#[cfg(test)]
+mod rail_tick_tests {
+    use super::*;
+
+    fn user_row(id: &str, text: &str) -> Row {
+        Row {
+            id: id.into(),
+            version: 0,
+            turn_start: true,
+            kind: RowKind::User {
+                text: text.into(),
+                mentions: Arc::new(Vec::new()),
+                attachments: Arc::new(Vec::new()),
+                badges: Arc::new(Vec::new()),
+                pending: false,
+            },
+            entry_id: id.into(),
+            timestamp: None,
+            copy_text: Some(text.into()),
+            compact_fold: None,
+        }
+    }
+
+    fn reply_row(id: &str, text: &str) -> Row {
+        Row {
+            id: id.into(),
+            version: 0,
+            turn_start: false,
+            kind: RowKind::ErrorChip {
+                message: SharedString::default(),
+            },
+            entry_id: id.into(),
+            timestamp: None,
+            copy_text: Some(text.into()),
+            compact_fold: None,
+        }
+    }
+
+    #[test]
+    fn rows_mode_ticks_follow_user_rows_and_their_reply() {
+        let rows = vec![
+            user_row("u1", "first prompt"),
+            reply_row("a1", "first reply"),
+            user_row("u2", "second prompt"),
+            reply_row("a2", "second reply"),
+        ];
+        let ticks = rail_ticks_from_rows(&rows);
+        assert_eq!(ticks.len(), 2);
+        assert_eq!(ticks[0].message_id, "u1");
+        assert_eq!(ticks[0].prompt, "first prompt");
+        assert_eq!(ticks[0].reply.as_deref(), Some("first reply"));
+        assert_eq!(ticks[1].message_id, "u2");
+        assert_eq!(ticks[1].reply.as_deref(), Some("second reply"));
+    }
+
+    #[test]
+    fn rows_mode_tick_without_a_reply_yet() {
+        let rows = vec![user_row("u1", "pending prompt")];
+        let ticks = rail_ticks_from_rows(&rows);
+        assert_eq!(ticks.len(), 1);
+        assert_eq!(ticks[0].reply, None);
     }
 }
