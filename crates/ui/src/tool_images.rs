@@ -359,6 +359,55 @@ impl ToolImages {
         free(released, cx);
     }
 
+    /// Local-only hosts (no engine) read the file from disk. A host with no
+    /// local device either has nothing to read and keeps the failed thumb.
+    fn start_local_load<V: 'static>(
+        &mut self,
+        key: ImageKey,
+        loader: &Loader,
+        get: fn(&mut V) -> &mut ToolImages,
+        cx: &mut Context<V>,
+    ) {
+        if loader.local_device.is_none() {
+            self.entries.insert(
+                key,
+                Entry {
+                    state: State::Failed,
+                    release_at: None,
+                },
+            );
+            return;
+        }
+        let task_key = key.clone();
+        let task = cx.spawn(async move |view, cx| {
+            let executor = cx.background_executor().clone();
+            let path = task_key.path.clone();
+            let decoded = executor
+                .spawn(async move {
+                    let bytes = std::fs::read(&path).ok()?;
+                    let mime = if path.to_ascii_lowercase().ends_with(".svg") {
+                        "image/svg+xml"
+                    } else {
+                        ""
+                    };
+                    decode_thumbnail(mime, bytes)
+                })
+                .await;
+            view.update(cx, |view, cx| {
+                get(view).finish(task_key, decoded, cx);
+                cx.notify();
+            })
+            .ok();
+        });
+        self.entries.insert(
+            key,
+            Entry {
+                state: State::Loading(task),
+                release_at: None,
+            },
+        );
+    }
+
     fn start_load<V: 'static>(
         &mut self,
         key: ImageKey,
@@ -367,13 +416,7 @@ impl ToolImages {
         cx: &mut Context<V>,
     ) {
         let Some(engine) = loader.engine.clone() else {
-            self.entries.insert(
-                key,
-                Entry {
-                    state: State::Failed,
-                    release_at: None,
-                },
-            );
+            self.start_local_load(key, loader, get, cx);
             return;
         };
         let target = (loader.local_device.as_deref() != Some(key.device.as_str()))
