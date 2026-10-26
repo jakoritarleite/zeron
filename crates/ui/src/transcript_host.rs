@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use gpui::{App, AppContext as _, AsyncApp, Entity, SharedString, Task};
+use gpui::{AnyElement, App, AppContext as _, AsyncApp, Entity, SharedString, Task, Window};
 
 use crate::attachments::LoadedAttachmentImage;
 use crate::state::{AppState, Indicator};
@@ -59,6 +59,15 @@ pub trait TranscriptHost {
     /// Rebuild the rows from the host's own model. Rows-mode fold, compact and
     /// route-exit refreshes call this instead of `snapshot`.
     fn rows(&self, _cx: &App) -> Option<Vec<Row>> {
+        None
+    }
+    /// Render one app-owned row. The default ignores custom data.
+    fn render_custom_row(
+        &self,
+        _row: &Row,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<AnyElement> {
         None
     }
     /// Re-kick every delivery road and restart the failed-send grace clock.

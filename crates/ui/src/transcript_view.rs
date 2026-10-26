@@ -25,6 +25,7 @@
 //! Wheel/touch releases that anchor immediately, including when background
 //! streaming has advanced beyond the last measured frame.
 
+use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
@@ -1107,6 +1108,12 @@ pub enum RowKind {
     ForkMarker {
         source_chat_id: SharedString,
         source_title: SharedString,
+    },
+    /// An app-owned row. The view treats `data` as opaque and asks the host
+    /// to render it; `key` is the app's stable identity inside that data.
+    Custom {
+        key: SharedString,
+        data: Arc<dyn Any + Send + Sync>,
     },
 }
 
@@ -8170,6 +8177,10 @@ impl TranscriptView {
             }
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
             RowKind::ForkMarker { source_title, .. } => fork_marker(source_title.clone(), &theme),
+            RowKind::Custom { .. } => self
+                .host
+                .render_custom_row(&row, window, cx)
+                .unwrap_or_else(|| gpui::Empty.into_any_element()),
         };
         // Diagram fences this row just requested start rendering after layout.
         self.ensure_diagram_worker(cx);

@@ -149,6 +149,14 @@ mod tests {
             Some(self.rows.borrow().clone())
         }
         fn retry_send(&self, _: &str, _: chrono::DateTime<chrono::Utc>, _: &mut App) {}
+        fn render_custom_row(
+            &self,
+            _: &Row,
+            _: &mut gpui::Window,
+            _: &mut gpui::App,
+        ) -> Option<gpui::AnyElement> {
+            Some(gpui::div().into_any_element())
+        }
         fn fetch_tool_blob(&self, _: SharedString, _: &gpui::AsyncApp) -> Task<Option<String>> {
             Task::ready(None)
         }
@@ -229,6 +237,31 @@ mod tests {
                 .rendered_rows
                 .contains(&SharedString::from("r0"))),
             "the spliced row must render"
+        );
+    }
+
+    #[gpui::test]
+    fn custom_rows_render_through_the_host(cx: &mut gpui::TestAppContext) {
+        let _dir = init_rows_test(cx);
+        let host = Rc::new(FakeRowsHost::new(Vec::new()));
+        let dyn_host: Rc<dyn TranscriptHost> = host.clone();
+        let view = cx.new(|cx| TranscriptView::with_host(dyn_host, None, true, cx));
+        let mut row = viewport_row("c0", "e0");
+        row.kind = RowKind::Custom {
+            key: "c0".into(),
+            data: Arc::new(()),
+        };
+        view.update(cx, |this, cx| {
+            this.set_rows(vec![row], TranscriptMeta::rows(1), cx);
+        });
+        let (fixture, cx) = cx.add_window_view(|_, _| RowsFixture(view.clone()));
+        fixture.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert!(
+            view.read_with(cx, |this, _| this
+                .rendered_rows
+                .contains(&SharedString::from("c0"))),
+            "the custom row must render through the host"
         );
     }
 
