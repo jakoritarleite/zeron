@@ -2475,6 +2475,427 @@ mod tests {
         }
     }
 
+    fn image_part(id: &str) -> MessagePart {
+        MessagePart::Image {
+            id: id.into(),
+            path: "/tmp/generated.png".into(),
+            name: "generated.png".into(),
+            mime_type: "image/png".into(),
+        }
+    }
+
+    struct FakeEntry {
+        id: String,
+        role: MessageRole,
+        status: Option<MessageStatus>,
+        created_at: i64,
+        duration_ms: Option<i64>,
+        device_id: String,
+        parts: Vec<MessagePart>,
+    }
+
+    impl TranscriptEntry for FakeEntry {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        fn role(&self) -> MessageRole {
+            self.role
+        }
+        fn status(&self) -> Option<MessageStatus> {
+            self.status
+        }
+        fn created_at(&self) -> i64 {
+            self.created_at
+        }
+        fn duration_ms(&self) -> Option<i64> {
+            self.duration_ms
+        }
+        fn device_id(&self) -> &str {
+            &self.device_id
+        }
+        fn part_count(&self) -> usize {
+            self.parts.len()
+        }
+        fn part(&self, ix: usize) -> EntryPart<'_> {
+            (&self.parts[ix]).into()
+        }
+    }
+
+    fn assert_rows_match(left: &[Row], right: &[Row]) {
+        assert_eq!(left.len(), right.len());
+        for (left, right) in left.iter().zip(right) {
+            assert_eq!(left.id, right.id);
+            assert_eq!(left.version, right.version);
+            assert_eq!(left.turn_start, right.turn_start);
+            assert_eq!(left.entry_id, right.entry_id);
+            assert_eq!(left.timestamp, right.timestamp);
+            assert_eq!(left.copy_text, right.copy_text);
+            assert_eq!(left.compact_fold, right.compact_fold);
+            match (&left.kind, &right.kind) {
+                (
+                    RowKind::Markdown {
+                        tree: lt,
+                        block_ix: li,
+                    },
+                    RowKind::Markdown {
+                        tree: rt,
+                        block_ix: ri,
+                    },
+                ) => {
+                    assert_eq!(lt, rt);
+                    assert_eq!(li, ri);
+                }
+                (
+                    RowKind::ToolGroup {
+                        summary: ls,
+                        tools: lt,
+                        auto_open: la,
+                        worked_secs: lw,
+                        compact_shell: lc,
+                    },
+                    RowKind::ToolGroup {
+                        summary: rs,
+                        tools: rt,
+                        auto_open: ra,
+                        worked_secs: rw,
+                        compact_shell: rc,
+                    },
+                ) => {
+                    assert_eq!(ls, rs);
+                    assert_eq!(lt, rt);
+                    assert_eq!(la, ra);
+                    assert_eq!(lw, rw);
+                    assert_eq!(lc, rc);
+                }
+                (
+                    RowKind::GeneratedImage {
+                        owner: lo,
+                        path: lp,
+                        name: ln,
+                        mime_type: lm,
+                    },
+                    RowKind::GeneratedImage {
+                        owner: ro,
+                        path: rp,
+                        name: rn,
+                        mime_type: rm,
+                    },
+                ) => {
+                    assert_eq!(lo, ro);
+                    assert_eq!(lp, rp);
+                    assert_eq!(ln, rn);
+                    assert_eq!(lm, rm);
+                }
+                _ => panic!("row kinds differ"),
+            }
+        }
+    }
+
+    /// The trait's borrowed view must feed the exact same rows as the
+    /// SessionMessageEntry path for every part kind the fake exercises.
+    #[test]
+    fn fake_entry_matches_session_entry_rows() {
+        let mut tool = tool_part("tool", "cargo test");
+        if let MessagePart::Tool {
+            is_error,
+            output,
+            output_ref,
+            output_bytes,
+            diff_ref,
+            diff_stats,
+            subagent_ref,
+            subagent_status,
+            subagent_tail,
+            ..
+        } = &mut tool
+        {
+            *is_error = true;
+            *output = Some("ok\n".into());
+            *output_ref = Some("chat/tool".into());
+            *output_bytes = Some(2);
+            *diff_ref = Some("chat/tool.diff".into());
+            *diff_stats = Some(vec![zeron_doc::ToolDiffStat {
+                path: "src/lib.rs".into(),
+                additions: 1,
+                deletions: 0,
+            }]);
+            *subagent_ref = Some("chat--sub".into());
+            *subagent_status = Some(SubagentStatus::Running);
+            *subagent_tail = Some("working".into());
+        }
+        let cases = [
+            assistant(
+                "fake-text",
+                MessageStatus::Complete,
+                vec![text_part("t0", "Hello **world**\n\nsecond")],
+            ),
+            assistant("fake-tool", MessageStatus::Complete, vec![tool]),
+            assistant("fake-image", MessageStatus::Complete, vec![image_part("i0")]),
+        ];
+        for entry in cases {
+            let fake = FakeEntry {
+                id: entry.id.clone(),
+                role: entry.role,
+                status: entry.status,
+                created_at: entry.created_at,
+                duration_ms: entry.duration_ms,
+                device_id: entry.device_id.clone(),
+                parts: entry.parts.clone(),
+            };
+            let real = rows_for_entry(&entry, false, false, &mut parse);
+            let borrowed = rows_for_entry(&fake, false, false, &mut parse);
+            assert_eq!(real.len(), borrowed.len());
+            assert!(!borrowed.is_empty());
+            assert_rows_match(&real, &borrowed);
+        }
+    }
+
+    fn assert_row_version_changes(
+        label: &str,
+        base: &SessionMessageEntry,
+        mutate: impl FnOnce(&mut SessionMessageEntry),
+    ) {
+        let before: Vec<u64> = rows_for_entry(base, false, false, &mut parse)
+            .iter()
+            .map(|row| row.version)
+            .collect();
+        let mut changed = base.clone();
+        mutate(&mut changed);
+        let after: Vec<u64> = rows_for_entry(&changed, false, false, &mut parse)
+            .iter()
+            .map(|row| row.version)
+            .collect();
+        assert_eq!(before.len(), after.len(), "{label}: row count changed");
+        assert_ne!(before, after, "{label} must re-splice its row");
+    }
+
+    #[test]
+    fn text_reasoning_input_and_error_versions_track_content() {
+        let text = assistant("m-text", MessageStatus::Complete, vec![text_part("t0", "alpha")]);
+        assert_row_version_changes("text", &text, |entry| {
+            if let MessagePart::Text { text, .. } = &mut entry.parts[0] {
+                *text = "beta".into();
+            }
+        });
+
+        let reasoning = assistant(
+            "m-think",
+            MessageStatus::Complete,
+            vec![reasoning_part("r0", "alpha")],
+        );
+        assert_row_version_changes("reasoning", &reasoning, |entry| {
+            if let MessagePart::Reasoning { text, .. } = &mut entry.parts[0] {
+                *text = "beta".into();
+            }
+        });
+
+        let input = assistant(
+            "m-input",
+            MessageStatus::Complete,
+            vec![MessagePart::Input {
+                id: "i0".into(),
+                request_id: "req".into(),
+                questions: vec![zeron_proto::UserInputQuestion {
+                    id: "q".into(),
+                    header: "Pick".into(),
+                    question: "Which?".into(),
+                    options: Vec::new(),
+                    multi_select: false,
+                    prefill: None,
+                    multiline: false,
+                }],
+                resolved: false,
+            }],
+        );
+        assert_row_version_changes("input resolved", &input, |entry| {
+            if let MessagePart::Input { resolved, .. } = &mut entry.parts[0] {
+                *resolved = true;
+            }
+        });
+
+        let error = assistant(
+            "m-error",
+            MessageStatus::Complete,
+            vec![MessagePart::Error {
+                id: "e0".into(),
+                message: "oops".into(),
+            }],
+        );
+        assert_row_version_changes("error", &error, |entry| {
+            if let MessagePart::Error { message, .. } = &mut entry.parts[0] {
+                // Same length as "oops": the version tracks bytes, not size.
+                *message = "nope".into();
+            }
+        });
+    }
+
+    #[test]
+    fn image_versions_track_path_name_and_mime() {
+        let image = assistant(
+            "m-image",
+            MessageStatus::Complete,
+            vec![image_part("i0")],
+        );
+        assert_row_version_changes("image path", &image, |entry| {
+            if let MessagePart::Image { path, .. } = &mut entry.parts[0] {
+                *path = "/tmp/edited.png".into();
+            }
+        });
+        assert_row_version_changes("image name", &image, |entry| {
+            if let MessagePart::Image { name, .. } = &mut entry.parts[0] {
+                *name = "edited.png".into();
+            }
+        });
+        assert_row_version_changes("image mime", &image, |entry| {
+            if let MessagePart::Image { mime_type, .. } = &mut entry.parts[0] {
+                *mime_type = "image/gif".into();
+            }
+        });
+    }
+
+    fn assert_tool_version_changes(
+        label: &str,
+        setup: impl FnOnce(&mut MessagePart),
+        mutate: impl FnOnce(&mut MessagePart),
+    ) {
+        let mut part = tool_part("t0", "ls");
+        setup(&mut part);
+        let base = assistant("m-tool", MessageStatus::Complete, vec![part]);
+        assert_row_version_changes(label, &base, |entry| mutate(&mut entry.parts[0]));
+    }
+
+    #[test]
+    fn tool_versions_track_every_rendered_field() {
+        assert_tool_version_changes("tool call", |_| {}, |part| {
+            if let MessagePart::Tool { call, .. } = part {
+                // Same length as `ls`: the version tracks the call bytes.
+                *call = ToolCall::Exec {
+                    command: "pwd".into(),
+                };
+            }
+        });
+        assert_tool_version_changes("tool is_error", |_| {}, |part| {
+            if let MessagePart::Tool { is_error, .. } = part {
+                *is_error = true;
+            }
+        });
+        assert_tool_version_changes("tool resolved", |_| {}, |part| {
+            if let MessagePart::Tool { resolved, .. } = part {
+                *resolved = false;
+            }
+        });
+        assert_tool_version_changes("tool output", |_| {}, |part| {
+            if let MessagePart::Tool { output, .. } = part {
+                *output = Some("one line\n".into());
+            }
+        });
+        assert_tool_version_changes(
+            "tool output_ref",
+            |part| {
+                if let MessagePart::Tool { output_ref, .. } = part {
+                    *output_ref = Some("chat/a".into());
+                }
+            },
+            |part| {
+                if let MessagePart::Tool { output_ref, .. } = part {
+                    *output_ref = Some("chat/b".into());
+                }
+            },
+        );
+        assert_tool_version_changes(
+            "tool output_bytes",
+            |part| {
+                if let MessagePart::Tool { output_bytes, .. } = part {
+                    *output_bytes = Some(1);
+                }
+            },
+            |part| {
+                if let MessagePart::Tool { output_bytes, .. } = part {
+                    *output_bytes = Some(2);
+                }
+            },
+        );
+        assert_tool_version_changes(
+            "tool diff_ref",
+            |part| {
+                if let MessagePart::Tool { diff_ref, .. } = part {
+                    *diff_ref = Some("chat/a.diff".into());
+                }
+            },
+            |part| {
+                if let MessagePart::Tool { diff_ref, .. } = part {
+                    *diff_ref = Some("chat/b.diff".into());
+                }
+            },
+        );
+        assert_tool_version_changes("tool diff_stats", |_| {}, |part| {
+            if let MessagePart::Tool { diff_stats, .. } = part {
+                *diff_stats = Some(vec![zeron_doc::ToolDiffStat {
+                    path: "src/lib.rs".into(),
+                    additions: 3,
+                    deletions: 1,
+                }]);
+            }
+        });
+        assert_tool_version_changes(
+            "tool subagent_ref",
+            |part| {
+                if let MessagePart::Tool { subagent_ref, .. } = part {
+                    *subagent_ref = Some("chat--a".into());
+                }
+            },
+            |part| {
+                if let MessagePart::Tool { subagent_ref, .. } = part {
+                    *subagent_ref = Some("chat--b".into());
+                }
+            },
+        );
+        assert_tool_version_changes("tool subagent_status", |_| {}, |part| {
+            if let MessagePart::Tool {
+                subagent_status, ..
+            } = part
+            {
+                *subagent_status = Some(SubagentStatus::Done);
+            }
+        });
+        assert_tool_version_changes(
+            "tool subagent_tail",
+            |part| {
+                if let MessagePart::Tool { subagent_tail, .. } = part {
+                    *subagent_tail = Some("a".into());
+                }
+            },
+            |part| {
+                if let MessagePart::Tool { subagent_tail, .. } = part {
+                    *subagent_tail = Some("b".into());
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn fork_versions_track_source_identity_and_title() {
+        let fork = assistant(
+            "m-fork",
+            MessageStatus::Complete,
+            vec![MessagePart::Fork {
+                id: "f0".into(),
+                source_chat_id: "chat-a".into(),
+                source_title: "Source".into(),
+            }],
+        );
+        assert_row_version_changes("fork source_chat_id", &fork, |entry| {
+            if let MessagePart::Fork { source_chat_id, .. } = &mut entry.parts[0] {
+                *source_chat_id = "chat-b".into();
+            }
+        });
+        assert_row_version_changes("fork source_title", &fork, |entry| {
+            if let MessagePart::Fork { source_title, .. } = &mut entry.parts[0] {
+                *source_title = "Renamed".into();
+            }
+        });
+    }
+
     const MD: &str = "# Title\n\npara one\n\n```rust\nlet x = 1;\n```";
 
     #[test]

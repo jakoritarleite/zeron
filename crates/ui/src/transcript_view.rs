@@ -1267,6 +1267,24 @@ pub(crate) fn tool_fingerprint(tools: &[ToolItem], auto_open: bool) -> u64 {
         if let Some(tail) = &t.subagent_tail {
             acc.extend_from_slice(tail.as_bytes());
         }
+        // The refs and output size are drawn (fetch affordance/label), so a
+        // re-stamped VALUE must re-splice, not just presence.
+        if let Some(output_ref) = &t.output_ref {
+            acc.push(5);
+            acc.extend_from_slice(output_ref.as_bytes());
+        }
+        if let Some(bytes) = t.output_bytes {
+            acc.push(6);
+            acc.extend_from_slice(&bytes.to_le_bytes());
+        }
+        if let Some(diff_ref) = &t.diff_ref {
+            acc.push(7);
+            acc.extend_from_slice(diff_ref.as_bytes());
+        }
+        if let Some(subagent_ref) = &t.subagent_ref {
+            acc.push(8);
+            acc.extend_from_slice(subagent_ref.as_bytes());
+        }
     }
     acc.push(auto_open as u8);
     fnv1a(&acc)
@@ -1275,19 +1293,19 @@ pub(crate) fn tool_fingerprint(tools: &[ToolItem], auto_open: bool) -> u64 {
 /// Clipboard payload for an assistant/system entry: authored text parts in
 /// document order, preserving Markdown while excluding tool traces and other
 /// structured parts.
-pub(crate) fn assistant_copy_text(entry: &SessionMessageEntry) -> Option<SharedString> {
-    let text = entry
-        .parts
-        .iter()
-        .filter_map(|part| match part {
-            // Inspect the trimmed view only to reject empty parts. Copy the
-            // original bytes so indentation-based code blocks and Markdown
-            // hard-break whitespace survive the clipboard round trip.
-            MessagePart::Text { text, .. } if !text.trim().is_empty() => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n");
+pub(crate) fn assistant_copy_text<E: TranscriptEntry + ?Sized>(entry: &E) -> Option<SharedString> {
+    let mut parts: Vec<&str> = Vec::new();
+    for ix in 0..entry.part_count() {
+        // Inspect the trimmed view only to reject empty parts. Copy the
+        // original bytes so indentation-based code blocks and Markdown
+        // hard-break whitespace survive the clipboard round trip.
+        if let EntryPart::Text { text, .. } = entry.part(ix)
+            && !text.trim().is_empty()
+        {
+            parts.push(text);
+        }
+    }
+    let text = parts.join("\n\n");
     (!text.is_empty()).then(|| text.into())
 }
 
@@ -1322,6 +1340,231 @@ pub fn user_resize_spec(height_delta: f32) -> motion::MotionSpec {
 #[cfg(test)]
 thread_local! { pub(crate) static FORBID_ROW_PREPARATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
+/// Borrowed entry view consumed by [`rows_for_entry`], so callers outside the
+/// session doc (zot's own messages) can feed the same row builder without
+/// cloning every part into a [`SessionMessageEntry`].
+pub trait TranscriptEntry {
+    fn id(&self) -> &str;
+    fn role(&self) -> MessageRole;
+    fn status(&self) -> Option<MessageStatus>;
+    fn created_at(&self) -> i64;
+    fn duration_ms(&self) -> Option<i64>;
+    /// Device owning generated images/visuals; part of those rows' versions.
+    fn device_id(&self) -> &str;
+    fn part_count(&self) -> usize;
+    fn part(&self, ix: usize) -> EntryPart<'_>;
+}
+
+/// Borrowed part read by [`rows_for_entry`].
+#[derive(Debug, Clone, Copy)]
+pub enum EntryPart<'a> {
+    Text {
+        id: &'a str,
+        text: &'a str,
+    },
+    Image {
+        id: &'a str,
+        path: &'a str,
+        name: &'a str,
+        mime_type: &'a str,
+    },
+    Visual {
+        id: &'a str,
+        path: &'a str,
+        title: &'a str,
+    },
+    Reasoning {
+        id: &'a str,
+        text: &'a str,
+    },
+    Tool {
+        id: &'a str,
+        call: &'a ToolCall,
+        is_error: bool,
+        resolved: bool,
+        output: Option<&'a str>,
+        diff: Option<&'a zeron_proto::ToolDiff>,
+        output_ref: Option<&'a str>,
+        output_bytes: Option<u64>,
+        diff_ref: Option<&'a str>,
+        diff_stats: Option<&'a [zeron_doc::ToolDiffStat]>,
+        subagent_ref: Option<&'a str>,
+        subagent_status: Option<SubagentStatus>,
+        subagent_tail: Option<&'a str>,
+    },
+    Input {
+        id: &'a str,
+        questions: &'a [zeron_proto::UserInputQuestion],
+        resolved: bool,
+    },
+    Error {
+        id: &'a str,
+        message: &'a str,
+    },
+    Fork {
+        id: &'a str,
+        source_chat_id: &'a str,
+        source_title: &'a str,
+    },
+}
+
+impl<'a> From<&'a MessagePart> for EntryPart<'a> {
+    fn from(part: &'a MessagePart) -> Self {
+        match part {
+            MessagePart::Text { id, text } => Self::Text { id, text },
+            MessagePart::Image {
+                id,
+                path,
+                name,
+                mime_type,
+            } => Self::Image {
+                id,
+                path,
+                name,
+                mime_type,
+            },
+            MessagePart::Visual { id, path, title } => Self::Visual { id, path, title },
+            MessagePart::Reasoning { id, text } => Self::Reasoning { id, text },
+            MessagePart::Tool {
+                id,
+                call,
+                is_error,
+                resolved,
+                output,
+                diff,
+                output_ref,
+                output_bytes,
+                diff_ref,
+                diff_stats,
+                subagent_ref,
+                subagent_status,
+                subagent_tail,
+            } => Self::Tool {
+                id,
+                call,
+                is_error: *is_error,
+                resolved: *resolved,
+                output: output.as_deref(),
+                diff: diff.as_ref(),
+                output_ref: output_ref.as_deref(),
+                output_bytes: *output_bytes,
+                diff_ref: diff_ref.as_deref(),
+                diff_stats: diff_stats.as_deref(),
+                subagent_ref: subagent_ref.as_deref(),
+                subagent_status: *subagent_status,
+                subagent_tail: subagent_tail.as_deref(),
+            },
+            MessagePart::Input {
+                id,
+                questions,
+                resolved,
+                ..
+            } => Self::Input {
+                id,
+                questions,
+                resolved: *resolved,
+            },
+            MessagePart::Error { id, message } => Self::Error { id, message },
+            MessagePart::Fork {
+                id,
+                source_chat_id,
+                source_title,
+            } => Self::Fork {
+                id,
+                source_chat_id,
+                source_title,
+            },
+        }
+    }
+}
+
+impl TranscriptEntry for SessionMessageEntry {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn role(&self) -> MessageRole {
+        self.role
+    }
+    fn status(&self) -> Option<MessageStatus> {
+        self.status
+    }
+    fn created_at(&self) -> i64 {
+        self.created_at
+    }
+    fn duration_ms(&self) -> Option<i64> {
+        self.duration_ms
+    }
+    fn device_id(&self) -> &str {
+        &self.device_id
+    }
+    fn part_count(&self) -> usize {
+        self.parts.len()
+    }
+    fn part(&self, ix: usize) -> EntryPart<'_> {
+        (&self.parts[ix]).into()
+    }
+}
+
+impl<T: TranscriptEntry + ?Sized> TranscriptEntry for &T {
+    fn id(&self) -> &str {
+        (**self).id()
+    }
+    fn role(&self) -> MessageRole {
+        (**self).role()
+    }
+    fn status(&self) -> Option<MessageStatus> {
+        (**self).status()
+    }
+    fn created_at(&self) -> i64 {
+        (**self).created_at()
+    }
+    fn duration_ms(&self) -> Option<i64> {
+        (**self).duration_ms()
+    }
+    fn device_id(&self) -> &str {
+        (**self).device_id()
+    }
+    fn part_count(&self) -> usize {
+        (**self).part_count()
+    }
+    fn part(&self, ix: usize) -> EntryPart<'_> {
+        (**self).part(ix)
+    }
+}
+
+/// Filtered index view behind compact mode's work-only recursive build.
+struct PartSubset<'a> {
+    entry: &'a dyn TranscriptEntry,
+    indices: &'a [usize],
+}
+
+impl TranscriptEntry for PartSubset<'_> {
+    fn id(&self) -> &str {
+        self.entry.id()
+    }
+    fn role(&self) -> MessageRole {
+        self.entry.role()
+    }
+    fn status(&self) -> Option<MessageStatus> {
+        self.entry.status()
+    }
+    fn created_at(&self) -> i64 {
+        self.entry.created_at()
+    }
+    fn duration_ms(&self) -> Option<i64> {
+        self.entry.duration_ms()
+    }
+    fn device_id(&self) -> &str {
+        self.entry.device_id()
+    }
+    fn part_count(&self) -> usize {
+        self.indices.len()
+    }
+    fn part(&self, ix: usize) -> EntryPart<'_> {
+        self.entry.part(self.indices[ix])
+    }
+}
+
 /// Build the block rows of one (already continuation-joined) entry.
 ///
 /// `parse` maps `(part_key, text)` to a block tree — the entity supplies
@@ -1331,8 +1574,21 @@ thread_local! { pub(crate) static FORBID_ROW_PREPARATION: std::cell::Cell<bool> 
 /// turn — tool calls, thoughts, and the narration text between them — folds
 /// into ONE collapsed [`RowKind::ToolGroup`], so only the reply text (the
 /// trailing run of text parts) stays a visible row.
-pub fn rows_for_entry(
-    entry: &SessionMessageEntry,
+pub fn rows_for_entry<E: TranscriptEntry + ?Sized>(
+    entry: &E,
+    pending: bool,
+    compact: bool,
+    parse: &mut dyn FnMut(&str, &str) -> Arc<BlockTree>,
+) -> Vec<Row> {
+    // `&entry` is the Sized forwarding impl, so this also accepts `dyn
+    // TranscriptEntry` callers without a monomorphized recursive body.
+    rows_for_entry_inner(&entry, pending, compact, parse)
+}
+
+/// Non-generic-in-compact body: compact recursion enters with a [`PartSubset`]
+/// (a single extra monomorphization), never a new type per nesting level.
+fn rows_for_entry_inner<E: TranscriptEntry>(
+    entry: &E,
     pending: bool,
     compact: bool,
     parse: &mut dyn FnMut(&str, &str) -> Arc<BlockTree>,
@@ -1341,19 +1597,17 @@ pub fn rows_for_entry(
     FORBID_ROW_PREPARATION
         .with(|forbidden| assert!(!forbidden.get(), "row preparation ran on the UI thread"));
     let mut rows: Vec<Row> = Vec::new();
-    let streaming = entry.status == Some(MessageStatus::Streaming);
-    let entry_id: SharedString = entry.id.clone().into();
+    let streaming = entry.status() == Some(MessageStatus::Streaming);
+    let entry_id: SharedString = entry.id().into();
 
-    if entry.role == MessageRole::User {
-        let raw: String = entry
-            .parts
-            .iter()
-            .filter_map(|p| match p {
-                MessagePart::Text { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n");
+    if entry.role() == MessageRole::User {
+        let mut texts: Vec<&str> = Vec::new();
+        for ix in 0..entry.part_count() {
+            if let EntryPart::Text { text, .. } = entry.part(ix) {
+                texts.push(text);
+            }
+        }
+        let raw = texts.join("\n\n");
         // Attachment refs ride the plain text (the `withAttachments`
         // transport); split them back out for the thumbnail strip.
         let parsed = crate::attachments::parse_user_message_images(&raw);
@@ -1393,7 +1647,7 @@ pub fn rows_for_entry(
         });
         let copy_text = (!text.trim().is_empty()).then(|| SharedString::from(text.clone()));
         return vec![Row {
-            id: entry.id.clone().into(),
+            id: entry.id().into(),
             version: (raw.len() as u64) << 1 | pending as u64,
             turn_start: true,
             kind: RowKind::User {
@@ -1406,7 +1660,7 @@ pub fn rows_for_entry(
             entry_id,
             // User rows always carry the strip (chat-view.tsx: whenever
             // `createdAt` exists — the optimistic echo included).
-            timestamp: Some(entry.created_at),
+            timestamp: Some(entry.created_at()),
             copy_text,
             compact_fold: None,
         }];
@@ -1415,7 +1669,7 @@ pub fn rows_for_entry(
     // Assistant/system: split parts into block rows, folding consecutive
     // ordinary tools. Agent/spawn chips flush into their own group so they
     // never share a collapse with Reads/Runs.
-    let last_part_ix = entry.parts.len().saturating_sub(1);
+    let last_part_ix = entry.part_count().saturating_sub(1);
     // Compact mode's reply boundary: the index where the turn's TRAILING run
     // of non-empty text parts begins. Every text part before it is narration
     // that folds into the single work group; the run itself stays visible
@@ -1425,13 +1679,16 @@ pub fn rows_for_entry(
     // on work (or is mid-flight) — only the accordion renders.
     let reply_start = (compact && !streaming)
         .then(|| {
-            let mut start = entry.parts.iter().rposition(
-                |part| matches!(part, MessagePart::Text { text, .. } if !text.trim().is_empty()),
-            )?;
+            let mut start = (0..entry.part_count()).rev().find(|&ix| {
+                matches!(
+                    entry.part(ix),
+                    EntryPart::Text { text, .. } if !text.trim().is_empty()
+                )
+            })?;
             while start > 0
                 && matches!(
-                    &entry.parts[start - 1],
-                    MessagePart::Text { text, .. } if !text.trim().is_empty()
+                    entry.part(start - 1),
+                    EntryPart::Text { text, .. } if !text.trim().is_empty()
                 )
             {
                 start -= 1;
@@ -1455,7 +1712,7 @@ pub fn rows_for_entry(
             let tools = std::mem::take(group);
             let auto_open = streaming && last_ix == last_part_ix;
             rows.push(Row {
-                id: format!("{}#g{}", entry.id, group_ix).into(),
+                id: format!("{}#g{}", entry.id(), group_ix).into(),
                 version: tool_fingerprint(&tools, auto_open),
                 turn_start: false,
                 kind: RowKind::ToolGroup {
@@ -1465,7 +1722,7 @@ pub fn rows_for_entry(
                     worked_secs: None,
                     compact_shell: false,
                 },
-                entry_id: entry.id.clone().into(),
+                entry_id: entry.id().into(),
                 timestamp: None,
                 copy_text: None,
                 compact_fold: None,
@@ -1473,9 +1730,10 @@ pub fn rows_for_entry(
             *group_ix += 1;
         };
 
-    for (part_ix, part) in entry.parts.iter().enumerate() {
-        match part {
-            MessagePart::Tool {
+    for part_ix in 0..entry.part_count() {
+        match entry.part(part_ix) {
+            EntryPart::Tool {
+                id: part_id,
                 call,
                 is_error,
                 resolved,
@@ -1488,24 +1746,22 @@ pub fn rows_for_entry(
                 subagent_ref,
                 subagent_status,
                 subagent_tail,
-                ..
             } => {
                 let item = ToolItem {
-                    part_id: part.id().to_owned(),
-                    call: call.clone(),
-                    is_error: *is_error,
-                    resolved: *resolved,
-                    detail: tool_detail(output.as_deref(), diff.as_ref(), diff_stats.as_deref())
-                        .map(Arc::new),
+                    part_id: part_id.to_owned(),
+                    call: (*call).clone(),
+                    is_error,
+                    resolved,
+                    detail: tool_detail(output, diff, diff_stats).map(Arc::new),
                     invocation: call_block(call).map(Arc::new),
-                    output_ref: output_ref.clone().map(SharedString::from),
-                    output_bytes: *output_bytes,
-                    diff_ref: diff_ref.clone().map(SharedString::from),
-                    subagent_ref: subagent_ref.clone().map(SharedString::from),
-                    subagent_status: *subagent_status,
-                    subagent_tail: subagent_tail.clone().map(SharedString::from),
+                    output_ref: output_ref.map(SharedString::from),
+                    output_bytes,
+                    diff_ref: diff_ref.map(SharedString::from),
+                    subagent_ref: subagent_ref.map(SharedString::from),
+                    subagent_status,
+                    subagent_tail: subagent_tail.map(SharedString::from),
                     kind: ToolItemKind::Call,
-                    images: crate::tool_images::image_paths(call, output.as_deref()),
+                    images: crate::tool_images::image_paths(call, output),
                 };
                 if compact {
                     // Compact mode keeps ONE group for the whole turn —
@@ -1530,7 +1786,7 @@ pub fn rows_for_entry(
             }
             // Thinking rides the SAME accordion as the tools around it
             // (user request) — a thought chip in the group, not its own row.
-            MessagePart::Reasoning { id: part_id, text } => {
+            EntryPart::Reasoning { id: part_id, text } => {
                 if text.trim().is_empty() {
                     continue;
                 }
@@ -1541,7 +1797,7 @@ pub fn rows_for_entry(
                 // The same parse wiring as text parts: incremental while
                 // streaming, hanging inline markers mended for display, the
                 // settled cache once complete.
-                let tree = parse(&format!("{}#{}", entry.id, part_id), text);
+                let tree = parse(&format!("{}#{}", entry.id(), part_id), text);
                 let item = thought_item(part_id, &tree, live);
                 if compact {
                     compact_group_pos.get_or_insert(rows.len());
@@ -1563,12 +1819,12 @@ pub fn rows_for_entry(
                 // a "Wrote" chip — only the reply (the trailing text run)
                 // stays a row.
                 if compact
-                    && let MessagePart::Text { id: part_id, text } = other
+                    && let EntryPart::Text { id: part_id, text } = other
                     && !text.trim().is_empty()
                     && reply_start.is_none_or(|start| part_ix < start)
                 {
                     compact_group_pos.get_or_insert(rows.len());
-                    let tree = parse(&format!("{}#{}", entry.id, part_id), text);
+                    let tree = parse(&format!("{}#{}", entry.id(), part_id), text);
                     let live = streaming && part_ix == last_part_ix;
                     pending_group.push(note_item(part_id, &tree, live));
                     group_last_part_ix = part_ix;
@@ -1583,11 +1839,11 @@ pub fn rows_for_entry(
                     );
                 }
                 match other {
-                    MessagePart::Text { id: part_id, text } => {
+                    EntryPart::Text { id: part_id, text } => {
                         if text.trim().is_empty() {
                             continue;
                         }
-                        let key = format!("{}#{}", entry.id, part_id);
+                        let key = format!("{}#{}", entry.id(), part_id);
                         let tree = parse(&key, text);
                         // Live and completed parts split identically — one row
                         // per top-level block, same ids, so the live→complete
@@ -1626,16 +1882,16 @@ pub fn rows_for_entry(
                             });
                         }
                     }
-                    MessagePart::Image {
+                    EntryPart::Image {
                         id: part_id,
                         path,
                         name,
                         mime_type,
                     } => {
                         rows.push(Row {
-                            id: format!("{}#{}", entry.id, part_id).into(),
+                            id: format!("{}#{}", entry.id(), part_id).into(),
                             version: fnv1a(
-                                format!("{}\0{path}\0{name}\0{mime_type}", entry.device_id)
+                                format!("{}\0{path}\0{name}\0{mime_type}", entry.device_id())
                                     .as_bytes(),
                             ),
                             turn_start: false,
@@ -1644,22 +1900,22 @@ pub fn rows_for_entry(
                             copy_text: None,
                             compact_fold: None,
                             kind: RowKind::GeneratedImage {
-                                owner: entry.device_id.clone(),
-                                path: path.clone(),
-                                name: name.clone(),
-                                mime_type: mime_type.clone(),
+                                owner: entry.device_id().to_owned(),
+                                path: path.to_owned(),
+                                name: name.to_owned(),
+                                mime_type: mime_type.to_owned(),
                             },
                         });
                     }
-                    MessagePart::Visual {
+                    EntryPart::Visual {
                         id: part_id,
                         path,
                         title,
                     } => {
                         rows.push(Row {
-                            id: format!("{}#{}", entry.id, part_id).into(),
+                            id: format!("{}#{}", entry.id(), part_id).into(),
                             version: fnv1a(
-                                format!("{}\0{path}\0{title}", entry.device_id).as_bytes(),
+                                format!("{}\0{path}\0{title}", entry.device_id()).as_bytes(),
                             ),
                             turn_start: false,
                             entry_id: entry_id.clone(),
@@ -1667,17 +1923,16 @@ pub fn rows_for_entry(
                             copy_text: None,
                             compact_fold: None,
                             kind: RowKind::Visual {
-                                owner: entry.device_id.clone(),
-                                path: path.clone(),
-                                title: title.clone(),
+                                owner: entry.device_id().to_owned(),
+                                path: path.to_owned(),
+                                title: title.to_owned(),
                             },
                         });
                     }
-                    MessagePart::Input {
+                    EntryPart::Input {
                         id: part_id,
                         questions,
                         resolved,
-                        ..
                     } => {
                         // Model-generated header onto the one-line chip.
                         let header: SharedString = single_line(
@@ -1688,26 +1943,23 @@ pub fn rows_for_entry(
                         )
                         .into();
                         rows.push(Row {
-                            id: format!("{}#{}", entry.id, part_id).into(),
-                            version: fnv1a(header.as_bytes()) << 1 | *resolved as u64,
+                            id: format!("{}#{}", entry.id(), part_id).into(),
+                            version: fnv1a(header.as_bytes()) << 1 | resolved as u64,
                             turn_start: false,
-                            kind: RowKind::InputChip {
-                                header,
-                                resolved: *resolved,
-                            },
+                            kind: RowKind::InputChip { header, resolved },
                             entry_id: entry_id.clone(),
                             timestamp: None,
                             copy_text: None,
                             compact_fold: None,
                         });
                     }
-                    MessagePart::Error {
+                    EntryPart::Error {
                         id: part_id,
                         message,
                     } => {
                         rows.push(Row {
-                            id: format!("{}#{}", entry.id, part_id).into(),
-                            version: message.len() as u64,
+                            id: format!("{}#{}", entry.id(), part_id).into(),
+                            version: fnv1a(message.as_bytes()),
                             turn_start: false,
                             kind: RowKind::ErrorChip {
                                 // Harness-generated; the chip is one line.
@@ -1719,17 +1971,17 @@ pub fn rows_for_entry(
                             compact_fold: None,
                         });
                     }
-                    MessagePart::Fork {
+                    EntryPart::Fork {
                         id: part_id,
                         source_chat_id,
                         source_title,
                     } => {
                         rows.push(Row {
-                            id: format!("{}#{}", entry.id, part_id).into(),
-                            version: fnv1a(source_title.as_bytes()),
+                            id: format!("{}#{}", entry.id(), part_id).into(),
+                            version: fnv1a(format!("{source_chat_id}\0{source_title}").as_bytes()),
                             turn_start: false,
                             kind: RowKind::ForkMarker {
-                                source_chat_id: source_chat_id.clone().into(),
+                                source_chat_id: source_chat_id.into(),
                                 source_title: single_line(source_title).into(),
                             },
                             entry_id: entry_id.clone(),
@@ -1740,7 +1992,7 @@ pub fn rows_for_entry(
                     }
                     // Tools and thoughts are grouped by the outer arms;
                     // nothing reaches here.
-                    MessagePart::Tool { .. } | MessagePart::Reasoning { .. } => {}
+                    EntryPart::Tool { .. } | EntryPart::Reasoning { .. } => {}
                 }
             }
         }
@@ -1750,24 +2002,18 @@ pub fn rows_for_entry(
         // would emit for the work parts, tagged so the fold can hide them.
         if !pending_group.is_empty() {
             let tools = std::mem::take(&mut pending_group);
-            let work_id: SharedString = format!("{}#work", entry.id).into();
-            let work_parts: Vec<MessagePart> = entry
-                .parts
-                .iter()
-                .enumerate()
-                .filter(|(ix, part)| is_compact_work_part(*ix, part, reply_start))
-                .map(|(_, part)| part.clone())
+            let work_id: SharedString = format!("{}#work", entry.id()).into();
+            let work_parts: Vec<usize> = (0..entry.part_count())
+                .filter(|&ix| is_compact_work_part(ix, entry.part(ix), reply_start))
                 .collect();
             let mut inner = if work_parts.is_empty() {
                 Vec::new()
             } else {
-                let work_entry = SessionMessageEntry {
-                    parts: work_parts,
-                    duration_ms: None,
-                    continuation_of: None,
-                    ..entry.clone()
+                let work_entry = PartSubset {
+                    entry: entry as &dyn TranscriptEntry,
+                    indices: &work_parts,
                 };
-                rows_for_entry(&work_entry, pending, false, parse)
+                rows_for_entry_inner(&work_entry, pending, false, parse)
             };
             for row in &mut inner {
                 row.turn_start = false;
@@ -1786,14 +2032,14 @@ pub fn rows_for_entry(
                     worked_secs: (!streaming)
                         .then(|| {
                             entry
-                                .duration_ms
+                                .duration_ms()
                                 .filter(|&ms| ms > 0)
                                 .map(|ms| (ms / 1000).max(1))
                         })
                         .flatten(),
                     compact_shell: true,
                 },
-                entry_id: entry.id.clone().into(),
+                entry_id: entry.id().into(),
                 timestamp: None,
                 copy_text: None,
                 compact_fold: None,
@@ -1824,18 +2070,22 @@ pub fn rows_for_entry(
         && let Some(last) = rows.last_mut()
         && !matches!(last.kind, RowKind::ForkMarker { .. })
     {
-        last.timestamp = Some(entry.created_at);
+        last.timestamp = Some(entry.created_at());
         last.copy_text = assistant_copy_text(entry);
         last.version ^= 1 << 62;
     }
     rows
 }
 
-pub(crate) fn is_compact_work_part(ix: usize, part: &MessagePart, reply_start: Option<usize>) -> bool {
+pub(crate) fn is_compact_work_part(
+    ix: usize,
+    part: EntryPart<'_>,
+    reply_start: Option<usize>,
+) -> bool {
     match part {
-        MessagePart::Tool { .. } => true,
-        MessagePart::Reasoning { text, .. } => !text.trim().is_empty(),
-        MessagePart::Text { text, .. } => {
+        EntryPart::Tool { .. } => true,
+        EntryPart::Reasoning { text, .. } => !text.trim().is_empty(),
+        EntryPart::Text { text, .. } => {
             !text.trim().is_empty() && reply_start.is_none_or(|start| ix < start)
         }
         _ => false,
