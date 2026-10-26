@@ -2398,7 +2398,7 @@ impl Shell {
             ConnectionStatus::Ready | ConnectionStatus::Failed(_) => SplashPhase::Gone,
         };
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
-        transcript.update(cx, |transcript, _| transcript.retain_for_route_exit());
+        transcript.update(cx, |transcript, cx| transcript.retain_for_route_exit(cx));
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
         let voice = cx.new(|_| crate::voice::VoiceController::default());
         let voice_footer_orb = cx.new(|_| {
@@ -2427,8 +2427,8 @@ impl Shell {
                 this.check_voice_codex(true, cx)
             });
         let links = Self::session_links(None, cx);
-        transcript.update(cx, |transcript, _| {
-            transcript.set_workspace_link_handler(links)
+        transcript.update(cx, |transcript, cx| {
+            transcript.set_workspace_link_handler(links, cx)
         });
         // Every send glides the prompt to the viewport top and reserves the
         // reply's space below it (notes-app parity).
@@ -4411,8 +4411,8 @@ impl Shell {
         let transcript =
             cx.new(|cx| Transcript::for_doc(self.state.clone(), doc_id.clone(), !frozen, cx));
         let links = Self::session_links(Some(self.active_chat.clone()), cx);
-        transcript.update(cx, |transcript, _| {
-            transcript.set_workspace_link_handler(links)
+        transcript.update(cx, |transcript, cx| {
+            transcript.set_workspace_link_handler(links, cx)
         });
         let events = cx.subscribe(&transcript, Self::on_transcript_event);
         let fetch = if frozen {
@@ -11551,7 +11551,7 @@ impl Shell {
     /// floating six pixels above the composer. It shares the composer's
     /// measured dock transform and paints after it, outside the transcript fade.
     fn render_jump_to_bottom(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.transcript.read(cx).jump_button_shown() {
+        if !self.transcript.read(cx).jump_button_shown(cx) {
             return None;
         }
         Some(
@@ -11930,7 +11930,7 @@ impl Shell {
                     // The pane hosts its own jump pill: the conversation
                     // overlay's is bound to the PRIMARY transcript, and this
                     // one anchors to the pane (no composer stack to clear).
-                    let pill = transcript.read(cx).jump_button_shown().then(|| {
+                    let pill = transcript.read(cx).jump_button_shown(cx).then(|| {
                         div()
                             .absolute()
                             .bottom(px(16.0))

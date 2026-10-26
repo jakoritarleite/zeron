@@ -15,7 +15,7 @@ use zeron_doc::{MessagePart, MessageRole, SessionMessageEntry};
 use crate::motion;
 use crate::popover;
 use crate::theme::Theme;
-use crate::transcript::Transcript;
+use crate::transcript_view::TranscriptView;
 
 /// 48rem — the container width below which the rail (and wide gutters) collapse.
 pub const RAIL_MIN_CONTAINER_WIDTH: f32 = 768.0;
@@ -231,7 +231,7 @@ fn scroll_trace_enabled() -> bool {
 // Rendering + smooth scroll (Transcript extension)
 // ---------------------------------------------------------------------------
 
-impl Transcript {
+impl TranscriptView {
     /// Smooth-scroll the list so `target` sits at the viewport top, reusing the
     /// transcript scroll-task slot (any running stick/jump animation yields).
     ///

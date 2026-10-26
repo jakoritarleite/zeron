@@ -205,8 +205,8 @@ impl Shell {
         // Workspace file links open the editor and web links honor the
         // in-app preference, resolved in this side chat's context.
         let links = Self::session_links(Some(chat_id), cx);
-        transcript.update(cx, |transcript, _| {
-            transcript.set_workspace_link_handler(links)
+        transcript.update(cx, |transcript, cx| {
+            transcript.set_workspace_link_handler(links, cx)
         });
         let composer = cx.new(|cx| {
             let mut composer = Composer::new(state.clone(), cx);
@@ -327,7 +327,7 @@ impl Shell {
             composer.set_dock_frame(crate::composer_dock::DockFrame::settled(true), cx);
             composer.set_available_width(width, cx);
         });
-        let pill = transcript.read(cx).jump_button_shown().then(|| {
+        let pill = transcript.read(cx).jump_button_shown(cx).then(|| {
             div()
                 .absolute()
                 .bottom(px(12.0))

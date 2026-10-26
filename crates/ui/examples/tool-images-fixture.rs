@@ -125,7 +125,7 @@ async fn self_check(
     std::fs::create_dir_all(dir)?;
     let transcript = window.update(cx, |shell, _, _| shell.fixture_transcript())?;
     let stats =
-        |cx: &mut gpui::AsyncApp| transcript.read_with(cx, |t, _| t.fixture_tool_image_stats());
+        |cx: &mut gpui::AsyncApp| transcript.read_with(cx, |t, cx| t.fixture_tool_image_stats(cx));
     let toggle = |open: bool, cx: &mut gpui::AsyncApp| {
         transcript.update(cx, |t, cx| t.fixture_tool_images(open, cx))
     };
