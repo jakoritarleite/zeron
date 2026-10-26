@@ -3737,6 +3737,14 @@ impl TranscriptMeta {
     }
 
     /// Meta for a host that supplies prebuilt rows: no prepared/baseline Arcs.
+    /// A rows-mode meta for one chat, so a view fed by an external app still
+    /// sees a chat switch.
+    pub fn for_chat(chat: Option<String>, revision: u64) -> Self {
+        let mut meta = Self::rows(revision);
+        meta.selected_chat = chat;
+        meta
+    }
+
     pub fn rows(revision: u64) -> Self {
         Self {
             selected_chat: None,
