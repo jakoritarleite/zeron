@@ -5917,6 +5917,12 @@ impl Transcript {
     ) -> Option<crate::markdown::render::LinkUi> {
         self.view.update(cx, |view, cx| view.link_ui(cx))
     }
+
+    /// zeron's pin rule, kept on the shell-facing handle for callers that
+    /// predate the view split.
+    pub fn should_restick(distance: f32, previous_distance: f32) -> bool {
+        TranscriptView::should_restick(distance, previous_distance)
+    }
 }
 
 impl Render for Transcript {
