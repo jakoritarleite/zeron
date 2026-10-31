@@ -1234,17 +1234,17 @@ impl AccountsPage {
         if !reports_usage(account.harness) {
             return None;
         }
-        let note = if !account.switchable && switches_accounts(account.harness) {
+        let note = if let Some(reason) = &account.usage_error {
+            // The engine's reason ("Rate limited by Anthropic — retrying in
+            // 2m", "Signed out — sign in again"), not a bare shrug.
+            reason.clone()
+        } else if !account.switchable && switches_accounts(account.harness) {
             match account.harness {
                 // Keychain denied: the login is there, its secret isn't.
                 HarnessId::ClaudeCode => "Credentials unavailable".to_string(),
                 // An opaque token whose account couldn't be looked up.
                 _ => "Couldn't identify this login".to_string(),
             }
-        } else if let Some(reason) = &account.usage_error {
-            // The engine's reason ("Rate limited by Anthropic — retrying in
-            // 2m", "Signed out — sign in again"), not a bare shrug.
-            reason.clone()
         } else if self.refreshing {
             "Checking usage…".to_string()
         } else {

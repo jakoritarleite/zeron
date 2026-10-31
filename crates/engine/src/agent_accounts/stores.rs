@@ -25,7 +25,10 @@
 //!   key}`), re-read on every request. zeron manages the OAuth entries of
 //!   `openai` (ChatGPT) and `github-copilot`; a swap rewrites that one entry
 //!   and leaves every other provider byte-for-byte. OpenCode has no lock of
-//!   its own. API-key entries aren't accounts and are left alone.
+//!   its own. API-key entries aren't accounts and are left alone, except the
+//!   OpenCode Go subscription: 2.x imports it into `opencode.db`'s
+//!   `credential` table (authoritative once migrated), so it is listed
+//!   read-only to probe its plan allowance.
 //!   Anthropic OAuth was removed from OpenCode upstream and is not offered.
 //! - **Pi** — `$PI_CODING_AGENT_DIR/auth.json` (default `~/.pi/agent`,
 //!   0600, guarded by proper-lockfile's `auth.json.lock` DIRECTORY): the
@@ -151,6 +154,7 @@ pub(super) fn upstream_vendor(store_key: &str) -> &'static str {
         "openai" | "openai-codex" => "OpenAI",
         "anthropic" => "Anthropic",
         "github-copilot" | "copilot" => "GitHub",
+        "opencode-go" => "OpenCode",
         "nous" => "Nous",
         "xai-oauth" | "xai" => "xAI",
         _ => "the provider",
@@ -327,6 +331,8 @@ pub(super) enum Upstream {
     Anthropic,
     /// GitHub Copilot (a GitHub OAuth token).
     Copilot,
+    /// The OpenCode Go subscription key (`opencode.ai/zen/go`).
+    Opencode,
 }
 
 /// The store keys zeron manages per agent.
@@ -335,6 +341,7 @@ pub(super) fn keyed_accounts(harness: HarnessId) -> &'static [(&'static str, Ups
         HarnessId::Opencode => &[
             ("openai", Upstream::OpenAi),
             ("github-copilot", Upstream::Copilot),
+            ("opencode-go", Upstream::Opencode),
         ],
         HarnessId::Pi => &[
             ("openai-codex", Upstream::OpenAi),
@@ -350,6 +357,27 @@ pub(super) fn upstream_of(harness: HarnessId, store_key: &str) -> Option<Upstrea
         .iter()
         .find(|(key, _)| *key == store_key)
         .map(|(_, upstream)| *upstream)
+}
+
+/// OpenCode Go's key from 2.x's SQLite credential table, which supersedes
+/// `auth.json` after its one-time import. Read only: the CLI owns the file.
+fn opencode_go_entry(auth_file: &Path) -> Option<serde_json::Value> {
+    let db = auth_file.parent()?.join("opencode.db");
+    if !db.is_file() {
+        return None;
+    }
+    let conn =
+        rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
+    let value: String = conn
+        .query_row(
+            "SELECT value FROM credential WHERE integration_id = 'opencode-go' \
+             AND (active IS NULL OR active = 1) ORDER BY active DESC, time_updated DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .ok()?;
+    serde_json::from_str(&value).ok()
 }
 
 /// An OAuth entry zeron can use: `type: "oauth"` with an access token.
@@ -390,6 +418,27 @@ pub(super) fn openai_detected(
                 plan: codex_plan(str_field(&auth, "chatgpt_plan_type").as_deref())
                     .or_else(|| Some("ChatGPT".to_string())),
                 auth_kind: AgentAuthKind::Oauth,
+            },
+            entry.clone(),
+        )
+        .keyed(store_key),
+    )
+}
+
+/// The OpenCode Go subscription login: a bare API key with no identity of its
+/// own, listed read-only so its plan allowance can be probed. Keyed by the
+/// store key, not the secret, so a rotated key updates this row in place.
+fn opencode_detected(store_key: &str, entry: &serde_json::Value) -> Option<Detected> {
+    str_field(entry, "key")?;
+    Some(
+        Detected::known(
+            store_key.to_string(),
+            SlotProfile {
+                email: "OpenCode Go".to_string(),
+                display_name: None,
+                organization: None,
+                plan: None,
+                auth_kind: AgentAuthKind::ApiKey,
             },
             entry.clone(),
         )
@@ -445,6 +494,7 @@ fn unresolved(store_key: &str, upstream: Upstream) -> Detected {
         Upstream::Anthropic => ("Claude account", "Claude"),
         Upstream::Copilot => ("GitHub account", "GitHub Copilot"),
         Upstream::OpenAi => ("ChatGPT account", "ChatGPT"),
+        Upstream::Opencode => ("OpenCode Go", "OpenCode Go"),
     };
     Detected {
         account_key: format!("{store_key}:unidentified"),
@@ -869,11 +919,21 @@ impl AgentAccounts {
     pub(super) async fn detect_keyed(&self, harness: HarnessId) -> (Vec<Detected>, Vec<Detected>) {
         let mut resolved = Vec::new();
         let mut unidentified = Vec::new();
-        let Some(store) = read_json(&self.keyed_file(harness)) else {
-            return (resolved, unidentified);
-        };
+        let mut store =
+            read_json(&self.keyed_file(harness)).unwrap_or_else(|| serde_json::json!({}));
+        // OpenCode 2.x imports auth.json into SQLite once, then keeps it
+        // there: the table is authoritative even while a stale auth.json
+        // still sits on disk.
+        if harness == HarnessId::Opencode
+            && let Some(entry) = opencode_go_entry(&self.inner.config.opencode_auth_file)
+        {
+            store["opencode-go"] = entry;
+        }
         for &(store_key, upstream) in keyed_accounts(harness) {
-            let Some(entry) = store.get(store_key).filter(|e| oauth_entry(e)) else {
+            let Some(entry) = store.get(store_key).filter(|entry| {
+                oauth_entry(entry)
+                    || (upstream == Upstream::Opencode && str_field(entry, "key").is_some())
+            }) else {
                 continue;
             };
             match self
@@ -911,6 +971,7 @@ impl AgentAccounts {
     ) -> Option<Detected> {
         match upstream {
             Upstream::OpenAi => openai_detected(store_key, entry, None),
+            Upstream::Opencode => opencode_detected(store_key, entry),
             Upstream::Anthropic | Upstream::Copilot => {
                 self.identify_opaque(harness, store_key, upstream, entry)
                     .await
@@ -962,7 +1023,7 @@ impl AgentAccounts {
                         None => None,
                     },
                     Upstream::Copilot => self.github_identity(store_key, &secret, entry).await,
-                    Upstream::OpenAi => None,
+                    Upstream::OpenAi | Upstream::Opencode => None,
                 };
                 let lookup = match &known {
                     Some((key, profile)) => IdentityLookup::Known(key.clone(), profile.clone()),

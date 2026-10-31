@@ -138,6 +138,7 @@ fn mocked(base: &str) -> ProbeEndpoints {
         openai_auth: base.to_string(),
         openai_port: 0,
         nous_portal: base.to_string(),
+        opencode_usage: format!("{base}/zen/go/v1/usage"),
         allow_slot_refresh: true,
         allow_loopback_http: true,
     }
@@ -686,6 +687,145 @@ done
     let devin = rows(&accounts.list(false).await.unwrap(), HarnessId::Devin);
     assert_eq!(devin.len(), 1);
     assert!(devin[0].active);
+}
+
+/// The OpenCode Go credential in 2.x's SQLite store, as a fresh install has it.
+fn seed_opencode_go_db(auth_file: &Path, key: &str) {
+    let db = auth_file.parent().unwrap().join("opencode.db");
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE credential (
+            id TEXT PRIMARY KEY, integration_id TEXT NOT NULL, label TEXT,
+            value TEXT NOT NULL, connector_id TEXT, method_id TEXT,
+            active INTEGER, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL
+        )",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO credential (id, integration_id, label, value, active, time_created, time_updated)
+         VALUES ('cred_go', 'opencode-go', 'OpenCode Go', ?1, 1, 1, 1)",
+        [serde_json::json!({ "type": "key", "key": key }).to_string()],
+    )
+    .unwrap();
+}
+
+fn opencode_go_body() -> String {
+    serde_json::json!({
+        "usage": {
+            "rolling": { "status": "ok", "percent": 1, "resetsAt": "2026-10-31T05:17:24.000Z" },
+            "weekly": { "status": "ok", "percent": 51, "resetsAt": "2026-11-02T00:00:00.000Z" },
+            "monthly": { "status": "ok", "percent": 25, "resetsAt": "2026-11-27T21:56:42.000Z" }
+        }
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn opencode_go_lists_from_the_v2_credential_table_and_probes_its_plan() {
+    let tmp = tempfile::tempdir().unwrap();
+    let body = opencode_go_body();
+    let mock = MockServer::start(move |_, _, _| (200, body.clone())).await;
+    let (accounts, config) = accounts_with(tmp.path(), mocked(&mock.base));
+    seed_opencode_go_db(&config.opencode_auth_file, "oc_sk_test_key");
+    // A slot saved by the earlier key-hash scheme must not survive as a
+    // duplicate row.
+    let legacy = config
+        .data_dir
+        .join("agent-accounts")
+        .join("opencode")
+        .join("legacy.json");
+    write(
+        &legacy,
+        &serde_json::json!({
+            "id": "legacy",
+            "harness": "opencode",
+            "accountKey": "opencode-go:deadbeef",
+            "profile": {
+                "email": "OpenCode Go ·…old1",
+                "plan": "OpenCode Go",
+                "authKind": "api-key"
+            },
+            "credentials": { "type": "key", "key": "oc_sk_old" },
+            "savedAt": 1,
+            "storeKey": "opencode-go"
+        })
+        .to_string(),
+    );
+
+    let snapshot = accounts.list(true).await.unwrap();
+    let rows = rows(&snapshot, HarnessId::Opencode);
+    assert_eq!(rows.len(), 1);
+    assert!(!legacy.exists(), "stale Go slot pruned");
+    let row = &rows[0];
+    assert!(row.active, "the only Go key is in use");
+    assert!(!row.switchable, "zeron never rewrites the credential table");
+    assert_eq!(row.auth_kind, Some(AgentAuthKind::ApiKey));
+    assert_eq!(row.email.as_deref(), Some("OpenCode Go"));
+    assert_eq!(row.plan_label, None, "no repeated plan label");
+    assert_eq!(row.provider.as_deref(), Some("opencode-go"));
+    assert_eq!(
+        row.usage_windows
+            .iter()
+            .map(|w| (w.label.as_str(), (w.used_fraction * 100.0).round() as u32))
+            .collect::<Vec<_>>(),
+        [("5-hour", 1), ("Week", 51), ("Month", 25)]
+    );
+    assert!(
+        row.usage_windows.iter().all(|w| w.resets_at.is_some()),
+        "RFC3339 resets parse"
+    );
+    assert_eq!(mock.hits("GET /zen/go/v1/usage"), 1);
+}
+
+#[tokio::test]
+async fn opencode_go_falls_back_to_auth_json_before_the_sqlite_migration() {
+    let tmp = tempfile::tempdir().unwrap();
+    let body = opencode_go_body();
+    let mock = MockServer::start(move |_, _, _| (200, body.clone())).await;
+    let (accounts, config) = accounts_with(tmp.path(), mocked(&mock.base));
+    write(
+        &config.opencode_auth_file,
+        &serde_json::json!({
+            "openai": { "type": "api", "key": "sk-not-an-account" },
+            "opencode-go": { "type": "key", "key": "oc_sk_legacy" },
+        })
+        .to_string(),
+    );
+
+    let snapshot = accounts.list(true).await.unwrap();
+    let rows = rows(&snapshot, HarnessId::Opencode);
+    assert_eq!(rows.len(), 1, "only the Go key is listed");
+    assert_eq!(rows[0].provider.as_deref(), Some("opencode-go"));
+    assert_eq!(rows[0].usage_windows.len(), 3);
+    assert_eq!(mock.hits("GET /zen/go/v1/usage"), 1);
+}
+
+#[test]
+fn opencode_go_usage_reads_three_allowances_and_clamps() {
+    let snapshot = opencode_usage_snapshot(&serde_json::from_str(&opencode_go_body()).unwrap())
+        .expect("three windows");
+    assert_eq!(
+        snapshot
+            .windows
+            .iter()
+            .map(|w| w.label.as_str())
+            .collect::<Vec<_>>(),
+        ["5-hour", "Week", "Month"]
+    );
+    assert!((snapshot.windows[1].used_fraction - 0.51).abs() < 1e-6);
+    assert_eq!(
+        snapshot.windows[0].resets_at.unwrap().to_rfc3339(),
+        "2026-10-31T05:17:24+00:00"
+    );
+
+    let over = serde_json::json!({ "usage": { "monthly": { "percent": 140 } } });
+    assert_eq!(
+        opencode_usage_snapshot(&over).unwrap().windows[0].used_fraction,
+        1.0
+    );
+    assert!(opencode_usage_snapshot(&serde_json::json!({ "usage": {} })).is_none());
+    assert!(opencode_usage_snapshot(&serde_json::json!({})).is_none());
 }
 
 // ── OpenCode / Pi ───────────────────────────────────────────────────────────

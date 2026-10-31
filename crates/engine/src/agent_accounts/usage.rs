@@ -15,6 +15,8 @@
 //! - **Claude logins** (Pi `anthropic`): Claude's `/api/oauth/usage`.
 //! - **Copilot** (OpenCode / Pi `github-copilot`):
 //!   `api.github.com/copilot_internal/user` — premium-request quota.
+//! - **OpenCode Go** (OpenCode `opencode-go`): `opencode.ai/zen/go/v1/usage`
+//!   — the plan's rolling / weekly / monthly allowances.
 //! - **Nous** (Hermes `nous`): the portal's `/api/oauth/account` credits.
 //!
 //! None of these refresh a per-provider store's tokens: those rotate, and
@@ -29,6 +31,7 @@ use super::*;
 
 pub(super) const GROK_USAGE_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
 pub(super) const NOUS_PORTAL: &str = "https://portal.nousresearch.com";
+pub(super) const OPENCODE_GO_USAGE_URL: &str = "https://opencode.ai/zen/go/v1/usage";
 const DEVIN_STATUS_RPC: &str = "exa.seat_management_pb.SeatManagementService/GetUserStatus";
 const DEVIN_DEFAULT_API_SERVER: &str = "https://server.codeium.com";
 /// The CLI version the status call identifies as (the server wants one).
@@ -283,6 +286,10 @@ impl AgentAccounts {
                 .ok_or(ProbeError::UntrustedEndpoint)?;
                 self.copilot_usage(&api, &token).await
             }
+            Some(Upstream::Opencode) => {
+                let key = str_field(creds, "key").ok_or(missing)?;
+                self.opencode_usage(&key).await
+            }
             None => Err(ProbeError::NoCredentials {
                 why: NoCredentials::Unsupported,
             }),
@@ -306,6 +313,20 @@ impl AgentAccounts {
         )
         .await?;
         codex_usage_snapshot(&body).ok_or_else(|| schema_error(provider, &body))
+    }
+
+    async fn opencode_usage(&self, key: &str) -> Result<UsageSnapshot, ProbeError> {
+        let body = probe_json(
+            "opencode",
+            "usage",
+            self.inner
+                .http
+                .get(&self.inner.endpoints.opencode_usage)
+                .bearer_auth(key)
+                .header("Accept", "application/json"),
+        )
+        .await?;
+        opencode_usage_snapshot(&body).ok_or_else(|| schema_error("opencode", &body))
     }
 
     async fn copilot_usage(&self, api: &str, token: &str) -> Result<UsageSnapshot, ProbeError> {
@@ -543,6 +564,32 @@ pub(super) fn copilot_usage_snapshot(body: &serde_json::Value) -> Option<UsageSn
     (!windows.is_empty() || plan_label.is_some()).then_some(UsageSnapshot {
         windows,
         plan_label,
+    })
+}
+
+/// OpenCode Go's `/zen/go/v1/usage`: the plan's rolling (5-hour), weekly and
+/// monthly allowances, each a used percent with an RFC3339 reset.
+pub(super) fn opencode_usage_snapshot(body: &serde_json::Value) -> Option<UsageSnapshot> {
+    let usage = body.get("usage")?;
+    let mut windows = Vec::new();
+    for (field, label) in [
+        ("rolling", "5-hour"),
+        ("weekly", "Week"),
+        ("monthly", "Month"),
+    ] {
+        let window = &usage[field];
+        let Some(percent) = window.get("percent").and_then(json_f64) else {
+            continue;
+        };
+        windows.push(AgentUsageWindow {
+            label: label.to_string(),
+            used_fraction: (percent / 100.0).clamp(0.0, 1.0) as f32,
+            resets_at: parse_when(window.get("resetsAt")),
+        });
+    }
+    (!windows.is_empty()).then_some(UsageSnapshot {
+        windows,
+        plan_label: None,
     })
 }
 

@@ -715,6 +715,8 @@ struct ProbeEndpoints {
     openai_port: u16,
     /// The Nous portal (`/api/oauth/account`).
     nous_portal: String,
+    /// OpenCode Go's plan allowances (`/zen/go/v1/usage`).
+    opencode_usage: String,
     allow_slot_refresh: bool,
     /// Test seam: admit `http://127.0.0.1` for credential-DEFINED endpoints
     /// (Grok issuer, Devin server, …) so mock servers can stand in. Always
@@ -736,6 +738,7 @@ impl Default for ProbeEndpoints {
             openai_auth: oauth::OPENAI_AUTH.into(),
             openai_port: oauth::OPENAI_LOOPBACK_PORT,
             nous_portal: usage::NOUS_PORTAL.into(),
+            opencode_usage: usage::OPENCODE_GO_USAGE_URL.into(),
             allow_slot_refresh: true,
             allow_loopback_http: false,
         }
@@ -964,6 +967,15 @@ impl AgentAccounts {
         detected_more.extend(self.detect_devin().map(|d| (HarnessId::Devin, d)));
         for harness in [HarnessId::Opencode, HarnessId::Pi] {
             let (resolved, unresolved) = self.detect_keyed(harness).await;
+            if harness == HarnessId::Opencode {
+                // One subscription, one row: a Go slot saved under an earlier
+                // key could never be switched back to (the row is read-only).
+                let live = resolved
+                    .iter()
+                    .find(|d| d.store_key.as_deref() == Some("opencode-go"))
+                    .map(|d| d.account_key.as_str());
+                self.prune_stale_go_slots(live);
+            }
             detected_more.extend(resolved.into_iter().map(|d| (harness, d)));
             for detected in unresolved {
                 live(harness, &detected);
@@ -1070,7 +1082,10 @@ impl AgentAccounts {
                     organization: slot.profile.organization.clone(),
                     auth_kind: Some(slot.profile.auth_kind),
                     // Hermes' pool is Hermes' to order (see module docs).
-                    switchable: harness != HarnessId::Hermes,
+                    // OpenCode Go is a subscription key, not a swappable
+                    // login: zeron never writes 2.x's credential table.
+                    switchable: harness != HarnessId::Hermes
+                        && slot.store_key.as_deref() != Some("opencode-go"),
                     saved_at: (harness != HarnessId::Hermes).then_some(slot.saved_at),
                     provider: provider_group(harness, slot.store_key.as_deref()),
                 });
@@ -2921,6 +2936,26 @@ impl AgentAccounts {
 
     // ── slot files ──────────────────────────────────────────────────────────
 
+    /// Drop OpenCode Go slots that are not the live key's. The row is
+    /// read-only (see module docs), so a slot saved under a rotated key could
+    /// only render as a duplicate account.
+    fn prune_stale_go_slots(&self, live: Option<&str>) {
+        let Ok(dir) = self.slots_dir(HarnessId::Opencode) else {
+            return;
+        };
+        for slot in self.read_slots(HarnessId::Opencode) {
+            if slot.store_key.as_deref() != Some("opencode-go")
+                || Some(slot.account_key.as_str()) == live
+            {
+                continue;
+            }
+            let file = dir.join(format!("{}.json", slot.id));
+            if let Err(err) = std::fs::remove_file(&file) {
+                tracing::warn!(slot = %slot.id, error = %err, "stale OpenCode Go slot kept");
+            }
+        }
+    }
+
     fn slots_dir(&self, harness: HarnessId) -> Result<PathBuf, EngineError> {
         let dir = self
             .inner
@@ -4074,6 +4109,9 @@ fn usage_error_message(
         // revoked, whichever login it is.
         ProbeError::Unauthorized { .. } if harness == HarnessId::Devin => {
             "Signed out — sign in again".to_string()
+        }
+        ProbeError::Unauthorized { .. } if store_key == Some("opencode-go") => {
+            "OpenCode Go key was rejected — reconnect it in OpenCode".to_string()
         }
         ProbeError::Unauthorized { .. } if active => {
             // The CLI owns (and refreshes) the live token; it just hasn't yet.
